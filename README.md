@@ -150,9 +150,7 @@ and committed each step before moving on.
 
 I also asked it to check its own work rather than taking it on trust: whether
 anything was hard-coded to pass the tests, and whether the tests would fail if
-the logic were broken. It answered by deliberately breaking the code in a
-throwaway copy and showing which tests failed. That turned up a concurrency
-test that couldn't fail, which we then fixed.
+the logic were broken.
 
 Two things I rejected and had rewritten:
 
