@@ -10,8 +10,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Optional
+
+from money import to_money
 
 
 class CarType(Enum):
@@ -65,7 +68,7 @@ class Ride:
     assigned_car_type: CarType
     status: RideStatus = RideStatus.ONGOING
     coupon_code: Optional[str] = None
-    fare: Optional[float] = None
+    fare: Optional[Decimal] = None
 
     @property
     def distance(self) -> float:
@@ -75,13 +78,13 @@ class Ride:
     def is_upgraded(self) -> bool:
         return self.requested_car_type != self.assigned_car_type
 
-    def complete(self, fare: float) -> None:
+    def complete(self, fare: Decimal) -> None:
         if self.status is not RideStatus.ONGOING:
             raise ValueError(f"Ride {self.id} is already {self.status.value}")
         self.status = RideStatus.COMPLETED
         self.fare = fare
 
-    def cancel(self, fee: float) -> None:
+    def cancel(self, fee: Decimal) -> None:
         if self.status is not RideStatus.ONGOING:
             raise ValueError(f"Ride {self.id} is already {self.status.value}")
         self.status = RideStatus.CANCELLED
@@ -91,7 +94,7 @@ class Ride:
 @dataclass(frozen=True)
 class Coupon:
     code: str
-    discount_percent: float
+    discount_percent: Decimal
     expires_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
@@ -101,5 +104,5 @@ class Coupon:
     def is_expired(self, now: datetime) -> bool:
         return self.expires_at is not None and now >= self.expires_at
 
-    def discount_for(self, fare: float) -> float:
-        return round(fare * self.discount_percent / 100, 2)
+    def discount_for(self, fare: Decimal) -> Decimal:
+        return to_money(fare * self.discount_percent / 100)

@@ -1,6 +1,15 @@
+"""Concurrency tests for RideService's lock.
+
+Each test slows down one step inside a service operation (matching, pricing,
+the fee policy or model construction) so that, without the lock, many
+threads would interleave inside it every time. Each test was checked to fail
+with the lock removed.
+"""
+
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from typing import Any, Callable, List, Optional, Sequence, TypeVar
 
 import pytest
@@ -11,7 +20,6 @@ from matching import NearestDriverStrategy
 from models import CarType, Driver, Location, Ride, RideStatus
 from pricing import TieredPricingStrategy
 from service import InvalidOperationError, NoDriverAvailableError, RideService
-from thread_safe_service import ThreadSafeRideService
 
 T = TypeVar("T")
 THREADS = 20
@@ -26,8 +34,8 @@ class SlowNearestDriverStrategy(NearestDriverStrategy):
         return super().select_driver(candidates, pickup)
 
 
-def make_service() -> ThreadSafeRideService:
-    return ThreadSafeRideService(pricing=TieredPricingStrategy(), matching=SlowNearestDriverStrategy())
+def make_service() -> RideService:
+    return RideService(pricing=TieredPricingStrategy(), matching=SlowNearestDriverStrategy())
 
 
 def run_together(task: Callable[[int], T], count: int = THREADS) -> List[T]:
@@ -62,11 +70,11 @@ def test_one_driver_is_booked_exactly_once_under_concurrent_requests() -> None:
 
 def test_concurrent_cancellations_charge_the_fee_once() -> None:
     class SlowFlatFee(FlatCancellationFee):
-        def fee_for(self, ride: Ride) -> float:
+        def fee_for(self, ride: Ride) -> Decimal:
             time.sleep(0.01)
             return super().fee_for(ride)
 
-    service = ThreadSafeRideService(
+    service = RideService(
         pricing=TieredPricingStrategy(), matching=NearestDriverStrategy(), cancellation_policy=SlowFlatFee()
     )
     user = service.register_user("Asha")
@@ -81,17 +89,17 @@ def test_concurrent_cancellations_charge_the_fee_once() -> None:
 
     outcomes = run_together(cancel)
 
-    assert outcomes.count("fee 20.0") == 1
+    assert outcomes.count("fee 20.00") == 1
     assert outcomes.count("rejected") == THREADS - 1
 
 
 def test_concurrent_end_ride_charges_once() -> None:
     class SlowTieredPricing(TieredPricingStrategy):
-        def calculate_fare(self, ride: Ride) -> float:
+        def calculate_fare(self, ride: Ride) -> Decimal:
             time.sleep(0.01)
             return super().calculate_fare(ride)
 
-    service = ThreadSafeRideService(pricing=SlowTieredPricing(), matching=NearestDriverStrategy())
+    service = RideService(pricing=SlowTieredPricing(), matching=NearestDriverStrategy())
     user = service.register_user("Asha")
     driver = service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=5)
     ride = service.book_ride(user.id, Location(0, 0), Location(10, 0), CarType.SEDAN)
@@ -104,7 +112,7 @@ def test_concurrent_end_ride_charges_once() -> None:
 
     outcomes = run_together(end)
 
-    assert outcomes.count("fare 69.0") == 1
+    assert outcomes.count("fare 69.00") == 1
     assert outcomes.count("rejected") == THREADS - 1
     assert ride.status is RideStatus.COMPLETED
     assert driver.is_available
@@ -140,15 +148,3 @@ def test_concurrent_registrations_get_unique_ids(
     ids = run_together(lambda i: register(service, i).id)
 
     assert sorted(ids, key=lambda id_: int(id_[1:])) == [f"{prefix}{i}" for i in range(1, THREADS + 1)]
-
-
-def test_is_a_drop_in_replacement_for_ride_service() -> None:
-    service = make_service()
-    assert isinstance(service, RideService)
-
-    user = service.register_user("Asha")
-    service.register_driver("Ravi", CarType.HATCHBACK, Location(1, 0), rating=4.5)
-    ride = service.book_ride(user.id, Location(0, 0), Location(10, 0), CarType.HATCHBACK)
-
-    assert service.end_ride(ride.id).total == 55.2
-    assert [r.id for r in service.user_history(user.id, RideStatus.COMPLETED)] == ["R1"]

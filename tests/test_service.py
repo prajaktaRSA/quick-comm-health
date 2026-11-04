@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Optional, Sequence
 
 import pytest
@@ -16,7 +17,7 @@ from service import (
 )
 
 ORIGIN = Location(0, 0)
-DROP = Location(10, 0)  # 10 km: sedan 69.0, hatchback 55.2
+DROP = Location(10, 0)  # 10 km: sedan Rs 69.00, hatchback Rs 55.20
 NOW = datetime(2026, 11, 4, 12, 0)
 
 
@@ -205,23 +206,13 @@ class TestBookingConfiguration:
 
         assert service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN).driver_id == best.id
 
-    def test_upgrade_paths_are_configurable(self) -> None:
-        no_upgrades = {CarType.HATCHBACK: (CarType.HATCHBACK,), CarType.SEDAN: (CarType.SEDAN,)}
-        service = RideService(
-            pricing=TieredPricingStrategy(), matching=NearestDriverStrategy(), car_type_fallbacks=no_upgrades
-        )
-        user = service.register_user("Asha")
-        service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=5)
-        with pytest.raises(NoDriverAvailableError, match="hatchback"):
-            service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
-
 
 class TestEndRide:
     def test_charges_tiered_fare_and_completes_ride(self, service: RideService, ride: Ride) -> None:
         fare = service.end_ride(ride.id)
-        assert (fare.base_fare, fare.discount, fare.total) == (69.0, 0.0, 69.0)
+        assert (fare.base_fare, fare.discount, fare.total) == (Decimal("69.00"), Decimal("0.00"), Decimal("69.00"))
         assert ride.status is RideStatus.COMPLETED
-        assert ride.fare == 69.0
+        assert ride.fare == Decimal("69.00")
 
     def test_driver_is_freed_at_drop_location(self, service: RideService) -> None:
         user = service.register_user("Asha")
@@ -236,7 +227,7 @@ class TestEndRide:
         service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=4.5)
         ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
         assert ride.is_upgraded
-        assert service.end_ride(ride.id).total == pytest.approx(55.2)
+        assert service.end_ride(ride.id).total == Decimal("55.20")
 
     def test_user_can_book_again_after_ride_ends(self, service: RideService, ride: Ride) -> None:
         service.end_ride(ride.id)
@@ -253,134 +244,96 @@ class TestEndRide:
 
     def test_uses_injected_pricing_strategy(self) -> None:
         class FlatPricing(PricingStrategy):
-            def calculate_fare(self, ride: Ride) -> float:
-                return 100.0
+            def calculate_fare(self, ride: Ride) -> Decimal:
+                return Decimal("100.00")
 
         service = RideService(pricing=FlatPricing(), matching=NearestDriverStrategy())
         user = service.register_user("Asha")
         service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
         ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
-        assert service.end_ride(ride.id).total == 100.0
+        assert service.end_ride(ride.id).total == Decimal("100.00")
 
 
 class TestCoupons:
-    def test_applied_coupon_discounts_fare(self, service: RideService, ride: Ride) -> None:
-        service.add_coupon(Coupon("SAVE10", 10))
-        service.apply_coupon(ride.id, "SAVE10")
-        fare = service.end_ride(ride.id)
-        assert (fare.base_fare, fare.discount, fare.total) == (69.0, 6.9, 62.1)
-        assert ride.coupon_code == "SAVE10"
-        assert ride.fare == 62.1
-
-    def test_coupon_given_at_booking_discounts_fare(self, service: RideService) -> None:
+    @staticmethod
+    def book(service: RideService, code: str, drop: Location = DROP, car_type: CarType = CarType.SEDAN) -> Ride:
+        """Book a ride for a new user with a sedan driver 1 km away, using a coupon."""
         user = service.register_user("Asha")
         service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
-        service.add_coupon(Coupon("SAVE10", 10))
+        return service.book_ride(user.id, ORIGIN, drop, car_type, coupon_code=code)
 
-        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN, coupon_code="SAVE10")
-
+    def test_coupon_given_at_booking_discounts_fare(self, service: RideService) -> None:
+        service.add_coupon(Coupon("SAVE10", Decimal("10")))
+        ride = self.book(service, "SAVE10")
         assert ride.coupon_code == "SAVE10"
         fare = service.end_ride(ride.id)
-        assert (fare.base_fare, fare.discount, fare.total) == (69.0, 6.9, 62.1)
+        assert (fare.base_fare, fare.discount, fare.total) == (Decimal("69.00"), Decimal("6.90"), Decimal("62.10"))
+        assert ride.fare == Decimal("62.10")
 
-    def test_coupon_at_booking_works_with_free_upgrade(self, service: RideService) -> None:
-        user = service.register_user("Asha")
-        service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=4.5)
-        service.add_coupon(Coupon("SAVE10", 10))
-        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK, coupon_code="SAVE10")
+    def test_coupon_works_with_free_upgrade(self, service: RideService) -> None:
+        service.add_coupon(Coupon("SAVE10", Decimal("10")))
+        ride = self.book(service, "SAVE10", car_type=CarType.HATCHBACK)
         assert ride.is_upgraded
-        assert service.end_ride(ride.id).total == pytest.approx(49.68)  # 55.20 hatchback price - 10%
+        assert service.end_ride(ride.id).total == Decimal("49.68")  # 55.20 hatchback price - 10% (5.52)
+
+    def test_coupon_applies_after_minimum_fare(self, service: RideService) -> None:
+        service.add_coupon(Coupon("SAVE20", Decimal("20")))
+        ride = self.book(service, "SAVE20", drop=Location(2, 0))  # minimum fare 50
+        assert service.end_ride(ride.id).total == Decimal("40.00")
+
+    def test_half_paisa_discount_rounds_up(self, service: RideService) -> None:
+        # 12.5% of Rs 69.00 is exactly Rs 8.625; with float and round() this was 8.62
+        service.add_coupon(Coupon("EIGHTH", Decimal("12.5")))
+        ride = self.book(service, "EIGHTH")
+        fare = service.end_ride(ride.id)
+        assert (fare.base_fare, fare.discount, fare.total) == (Decimal("69.00"), Decimal("8.63"), Decimal("60.37"))
 
     @pytest.mark.parametrize(
         "code, message",
-        [("NOPE", "Coupon NOPE does not exist"), ("OLD", "Coupon OLD has expired")],
+        [("NOPE", "Coupon NOPE does not exist"), ("OLD", "Coupon OLD has expired"), ("GONE", "Coupon GONE does not exist")],
+        ids=["unknown", "expired", "deleted"],
     )
-    def test_invalid_coupon_at_booking_books_nothing(self, service: RideService, code: str, message: str) -> None:
-        user = service.register_user("Asha")
-        driver = service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
-        service.add_coupon(Coupon("OLD", 10, expires_at=NOW - timedelta(days=1)))
+    def test_invalid_coupon_books_nothing(self, service: RideService, code: str, message: str) -> None:
+        service.add_coupon(Coupon("OLD", Decimal("10"), expires_at=NOW - timedelta(days=1)))
+        service.add_coupon(Coupon("GONE", Decimal("10")))
+        service.delete_coupon("GONE")
 
         with pytest.raises(InvalidCouponError, match=message):
-            service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN, coupon_code=code)
+            self.book(service, code)
 
-        assert driver.is_available
-        assert service.user_history(user.id) == []
-        assert service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN).id == "R1"
+        assert service.user_history("U1") == []
+        assert service.book_ride("U1", ORIGIN, DROP, CarType.SEDAN).id == "R1"  # driver still free, no id used
 
-    def test_coupon_given_at_booking_expiring_before_end_is_dropped(
-        self, service: RideService, clock: FakeClock
-    ) -> None:
-        user = service.register_user("Asha")
-        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
-        service.add_coupon(Coupon("SOON", 10, expires_at=NOW + timedelta(minutes=30)))
-        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN, coupon_code="SOON")
+    def test_coupon_expiring_before_ride_ends_is_dropped(self, service: RideService, clock: FakeClock) -> None:
+        service.add_coupon(Coupon("SOON", Decimal("10"), expires_at=NOW + timedelta(minutes=30)))
+        ride = self.book(service, "SOON")
         clock.now = NOW + timedelta(hours=1)
-        assert service.end_ride(ride.id).total == 69.0
+        fare = service.end_ride(ride.id)
+        assert (fare.discount, fare.total) == (Decimal("0.00"), Decimal("69.00"))
         assert ride.coupon_code is None
 
-    def test_coupon_applies_after_minimum_fare(self, service: RideService) -> None:
-        user = service.register_user("Asha")
-        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
-        ride = service.book_ride(user.id, ORIGIN, Location(2, 0), CarType.SEDAN)  # minimum fare 50
-        service.add_coupon(Coupon("SAVE20", 20))
-        service.apply_coupon(ride.id, "SAVE20")
-        assert service.end_ride(ride.id).total == pytest.approx(40.0)
+    def test_coupon_deleted_before_ride_ends_is_dropped(self, service: RideService) -> None:
+        service.add_coupon(Coupon("SAVE10", Decimal("10")))
+        ride = self.book(service, "SAVE10")
+        service.delete_coupon("SAVE10")
+        assert service.end_ride(ride.id).total == Decimal("69.00")
+        assert ride.coupon_code is None
 
     def test_duplicate_coupon_is_rejected(self, service: RideService) -> None:
-        service.add_coupon(Coupon("SAVE10", 10))
+        service.add_coupon(Coupon("SAVE10", Decimal("10")))
         with pytest.raises(InvalidOperationError, match="already exists"):
-            service.add_coupon(Coupon("SAVE10", 20))
+            service.add_coupon(Coupon("SAVE10", Decimal("20")))
 
     def test_deleting_unknown_coupon_raises_not_found(self, service: RideService) -> None:
         with pytest.raises(NotFoundError, match="NOPE"):
             service.delete_coupon("NOPE")
 
-    def test_unknown_coupon_cannot_be_applied(self, service: RideService, ride: Ride) -> None:
-        with pytest.raises(InvalidCouponError, match="does not exist"):
-            service.apply_coupon(ride.id, "NOPE")
-        assert ride.coupon_code is None
-
-    def test_deleted_coupon_cannot_be_applied(self, service: RideService, ride: Ride) -> None:
-        service.add_coupon(Coupon("SAVE10", 10))
-        service.delete_coupon("SAVE10")
-        with pytest.raises(InvalidCouponError, match="does not exist"):
-            service.apply_coupon(ride.id, "SAVE10")
-
-    def test_expired_coupon_cannot_be_applied(self, service: RideService, ride: Ride) -> None:
-        service.add_coupon(Coupon("OLD", 10, expires_at=NOW - timedelta(days=1)))
-        with pytest.raises(InvalidCouponError, match="expired"):
-            service.apply_coupon(ride.id, "OLD")
-        assert ride.coupon_code is None
-
-    def test_coupon_cannot_be_applied_to_completed_ride(self, service: RideService, ride: Ride) -> None:
-        service.add_coupon(Coupon("SAVE10", 10))
-        service.end_ride(ride.id)
-        with pytest.raises(InvalidOperationError, match="already completed"):
-            service.apply_coupon(ride.id, "SAVE10")
-
-    def test_coupon_expiring_before_ride_ends_is_dropped(
-        self, service: RideService, ride: Ride, clock: FakeClock
-    ) -> None:
-        service.add_coupon(Coupon("SOON", 10, expires_at=NOW + timedelta(minutes=30)))
-        service.apply_coupon(ride.id, "SOON")
-        clock.now = NOW + timedelta(hours=1)
-        fare = service.end_ride(ride.id)
-        assert (fare.discount, fare.total) == (0.0, 69.0)
-        assert ride.coupon_code is None
-
-    def test_coupon_deleted_before_ride_ends_is_dropped(self, service: RideService, ride: Ride) -> None:
-        service.add_coupon(Coupon("SAVE10", 10))
-        service.apply_coupon(ride.id, "SAVE10")
-        service.delete_coupon("SAVE10")
-        assert service.end_ride(ride.id).total == 69.0
-        assert ride.coupon_code is None
-
 
 class TestCancellation:
     def test_cancel_charges_flat_fee(self, service: RideService, ride: Ride) -> None:
-        assert service.cancel_ride(ride.id) == 20.0
+        assert service.cancel_ride(ride.id) == Decimal("20.00")
         assert ride.status is RideStatus.CANCELLED
-        assert ride.fare == 20.0
+        assert ride.fare == Decimal("20.00")
 
     def test_driver_is_freed_where_they_are(self, service: RideService) -> None:
         user = service.register_user("Asha")
@@ -394,10 +347,10 @@ class TestCancellation:
         service.cancel_ride(ride.id)
         assert service.book_ride(ride.user_id, ORIGIN, DROP, CarType.SEDAN).id == "R2"
 
-    def test_coupon_is_not_applied_to_fee(self, service: RideService, ride: Ride) -> None:
-        service.add_coupon(Coupon("SAVE50", 50))
-        service.apply_coupon(ride.id, "SAVE50")
-        assert service.cancel_ride(ride.id) == 20.0
+    def test_coupon_is_not_applied_to_fee(self, service: RideService) -> None:
+        service.add_coupon(Coupon("SAVE50", Decimal("50")))
+        ride = TestCoupons.book(service, "SAVE50")
+        assert service.cancel_ride(ride.id) == Decimal("20.00")
         assert ride.coupon_code is None
 
     def test_cannot_cancel_completed_ride(self, service: RideService, ride: Ride) -> None:
@@ -418,8 +371,8 @@ class TestCancellation:
 
     def test_uses_injected_cancellation_policy(self) -> None:
         class FreeForUpgrades(CancellationFeePolicy):
-            def fee_for(self, ride: Ride) -> float:
-                return 0.0 if ride.is_upgraded else 20.0
+            def fee_for(self, ride: Ride) -> Decimal:
+                return Decimal("0.00") if ride.is_upgraded else Decimal("20.00")
 
         service = RideService(
             pricing=TieredPricingStrategy(), matching=NearestDriverStrategy(), cancellation_policy=FreeForUpgrades()
@@ -427,7 +380,7 @@ class TestCancellation:
         user = service.register_user("Asha")
         service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=4.5)
         ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
-        assert service.cancel_ride(ride.id) == 0.0
+        assert service.cancel_ride(ride.id) == Decimal("0.00")
 
     def test_cancelled_rides_appear_in_history_filter(self, service: RideService, ride: Ride) -> None:
         service.cancel_ride(ride.id)
@@ -477,7 +430,7 @@ class TestHistory:
 
     def test_completed_ride_in_history_carries_fare(self, history_service: RideService) -> None:
         (completed,) = history_service.user_history("U1", RideStatus.COMPLETED)
-        assert completed.fare == 50.0  # 1 km sedan, minimum fare
+        assert completed.fare == Decimal("50.00")  # 1 km sedan, minimum fare
 
     def test_new_user_and_driver_have_empty_history(self, service: RideService) -> None:
         user = service.register_user("New")

@@ -13,13 +13,13 @@ from __future__ import annotations
 import argparse
 import cmd
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional, Sequence, Type
 
 from matching import HighestRatedDriverStrategy, MatchingStrategy, NearestDriverStrategy
 from models import CarType, Coupon, Location, Ride, RideStatus
 from pricing import TieredPricingStrategy
 from service import RideService, RideServiceError
-from thread_safe_service import ThreadSafeRideService
 
 DEMO_SCRIPT = [
     "add_user Asha",
@@ -59,7 +59,7 @@ MATCHING_STRATEGIES: Dict[str, Type[MatchingStrategy]] = {
 def build_service(matching: str = "nearest") -> RideService:
     if matching not in MATCHING_STRATEGIES:
         raise ValueError(f"unknown matching strategy {matching!r} (choose from {', '.join(MATCHING_STRATEGIES)})")
-    return ThreadSafeRideService(
+    return RideService(
         pricing=TieredPricingStrategy(),
         matching=MATCHING_STRATEGIES[matching](),
         search_radius=5.0,
@@ -90,6 +90,17 @@ def _choice(enum_type, value: str):
     except ValueError:
         choices = ", ".join(member.value for member in enum_type)
         raise ValueError(f"unknown value {value!r} (choose from {choices})") from None
+
+
+def _decimal(value: str) -> Decimal:
+    """Parse a money or percentage argument exactly (never via float)."""
+    try:
+        number = Decimal(value)
+    except InvalidOperation:
+        raise ValueError(f"not a number: {value!r}") from None
+    if not number.is_finite():
+        raise ValueError(f"not a number: {value!r}")
+    return number
 
 
 def _location(x: str, y: str) -> Location:
@@ -190,7 +201,7 @@ class RideHailingCLI(cmd.Cmd):
         """add_coupon CODE PERCENT [EXPIRES_AT]  - EXPIRES_AT as YYYY-MM-DD or YYYY-MM-DDTHH:MM"""
         args = _split(line, "add_coupon CODE PERCENT [EXPIRES_AT]", 2, optional=1)
         expires_at = datetime.fromisoformat(args[2]) if len(args) == 3 else None
-        coupon = Coupon(args[0], float(args[1]), expires_at)
+        coupon = Coupon(args[0], _decimal(args[1]), expires_at)
         self.service.add_coupon(coupon)
         expiry = f", expires {expires_at:%Y-%m-%d %H:%M}" if expires_at else ""
         print(f"Added coupon {coupon.code} ({coupon.discount_percent:g}% off{expiry})")
@@ -200,12 +211,6 @@ class RideHailingCLI(cmd.Cmd):
         (code,) = _split(line, "delete_coupon CODE", 1)
         self.service.delete_coupon(code)
         print(f"Deleted coupon {code}")
-
-    def do_apply_coupon(self, line: str) -> None:
-        """apply_coupon RIDE_ID CODE  - add a coupon to an ongoing ride booked without one"""
-        ride_id, code = _split(line, "apply_coupon RIDE_ID CODE", 2)
-        self.service.apply_coupon(ride_id, code)
-        print(f"Coupon {code} applied to {ride_id}")
 
     def do_demo(self, line: str) -> None:
         """demo  - run a scripted walkthrough on a fresh service with nearest matching"""

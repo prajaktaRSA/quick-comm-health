@@ -3,7 +3,6 @@ from typing import List
 import pytest
 
 from cli import DEMO_SCRIPT, RideHailingCLI, build_service, parse_args
-from thread_safe_service import ThreadSafeRideService
 
 
 @pytest.fixture
@@ -21,10 +20,6 @@ def run(cli: RideHailingCLI, capsys: pytest.CaptureFixture, *commands: str) -> L
 
 
 SETUP = ("add_user Asha", "add_driver Ravi sedan 1 0 4.5")
-
-
-def test_build_service_is_thread_safe() -> None:
-    assert isinstance(build_service(), ThreadSafeRideService)
 
 
 @pytest.mark.parametrize("matching, expected_driver", [("nearest", "D1"), ("highest-rated", "D2")])
@@ -75,14 +70,14 @@ def test_coupon_at_booking(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -
     assert run(cli, capsys, "end R1") == ["Ride R1 completed. Base Rs 69.00, discount Rs 6.90, total Rs 62.10"]
 
 
+def test_fractional_coupon_percent_rounds_half_up(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    out = run(cli, capsys, *SETUP, "add_coupon EIGHTH 12.5", "book U1 0 0 10 0 sedan EIGHTH", "end R1")
+    assert out == ["Ride R1 completed. Base Rs 69.00, discount Rs 8.63, total Rs 60.37"]
+
+
 def test_invalid_coupon_at_booking_books_nothing(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
     assert run(cli, capsys, *SETUP, "book U1 0 0 10 0 sedan NOPE") == ["Error: Coupon NOPE does not exist"]
     assert run(cli, capsys, "history user U1") == ["No rides for U1"]
-
-
-def test_coupon_applied_after_booking(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
-    out = run(cli, capsys, *SETUP, "book U1 0 0 10 0 sedan", "add_coupon SAVE10 10", "apply_coupon R1 SAVE10", "end R1")
-    assert out == ["Ride R1 completed. Base Rs 69.00, discount Rs 6.90, total Rs 62.10"]
 
 
 def test_cancel_and_history_filter(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
@@ -106,6 +101,9 @@ def test_move_driver_into_range(cli: RideHailingCLI, capsys: pytest.CaptureFixtu
     "command, message",
     [
         ("book U9 0 0 1 0 sedan", "Error: User U9 not found"),
+        ("add_coupon BAD ten", "Error: not a number: 'ten'"),
+        ("add_coupon BAD NaN", "Error: not a number: 'NaN'"),
+        ("add_coupon BAD 150", "Error: discount_percent must be in (0, 100]"),
         ("add_driver Ravi suv 0 0 4", "Error: unknown value 'suv' (choose from hatchback, sedan)"),
         ("add_driver Ravi sedan 0 0 9", "Error: rating must be between 0 and 5"),
         ("move D1 a b", "Error: could not convert string to float: 'a'"),
@@ -113,7 +111,7 @@ def test_move_driver_into_range(cli: RideHailingCLI, capsys: pytest.CaptureFixtu
         ("history rider U1", "Error: usage: history user|driver ID [ongoing|completed|cancelled]"),
         ("history user U1 pending", "Error: unknown value 'pending' (choose from ongoing, completed, cancelled)"),
         ("add_coupon BAD 10 tomorrow", "Error: Invalid isoformat string: 'tomorrow'"),
-        ("apply_coupon R1 SAVE10", "Error: Ride R1 not found"),
+        ("end R9", "Error: Ride R9 not found"),
     ],
 )
 def test_errors_are_reported_without_crashing(

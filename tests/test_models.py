@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -8,25 +9,37 @@ NOW = datetime(2026, 11, 4, 12, 0)
 
 
 class TestCoupon:
-    @pytest.mark.parametrize("percent, fare, expected", [(10, 69.0, 6.9), (20, 55.2, 11.04), (100, 50.0, 50.0)])
-    def test_discount_is_percentage_of_fare(self, percent: float, fare: float, expected: float) -> None:
-        assert Coupon("SAVE", percent).discount_for(fare) == pytest.approx(expected)
+    @pytest.mark.parametrize(
+        "percent, fare, expected",
+        [
+            ("10", "69.00", "6.90"),
+            ("20", "55.20", "11.04"),
+            ("100", "50.00", "50.00"),
+            ("12.5", "69.00", "8.63"),   # exactly 8.625: float round() gives 8.62
+            ("10", "55.75", "5.58"),     # exactly 5.575
+            ("33.3", "69.00", "22.98"),  # 22.977
+        ],
+    )
+    def test_discount_is_percentage_rounded_half_up_to_the_paisa(self, percent: str, fare: str, expected: str) -> None:
+        discount = Coupon("SAVE", Decimal(percent)).discount_for(Decimal(fare))
+        assert discount == Decimal(expected)
+        assert discount.as_tuple().exponent == -2
 
     def test_not_expired_before_expiry(self) -> None:
-        assert not Coupon("SAVE", 10, expires_at=NOW + timedelta(seconds=1)).is_expired(NOW)
+        assert not Coupon("SAVE", Decimal("10"), expires_at=NOW + timedelta(seconds=1)).is_expired(NOW)
 
     def test_expired_at_and_after_expiry(self) -> None:
-        coupon = Coupon("SAVE", 10, expires_at=NOW)
+        coupon = Coupon("SAVE", Decimal("10"), expires_at=NOW)
         assert coupon.is_expired(NOW)
         assert coupon.is_expired(NOW + timedelta(days=1))
 
     def test_coupon_without_expiry_never_expires(self) -> None:
-        assert not Coupon("SAVE", 10).is_expired(NOW + timedelta(days=3650))
+        assert not Coupon("SAVE", Decimal("10")).is_expired(NOW + timedelta(days=3650))
 
-    @pytest.mark.parametrize("percent", [0, -5, 100.01])
-    def test_rejects_invalid_percent(self, percent: float) -> None:
+    @pytest.mark.parametrize("percent", ["0", "-5", "100.01"])
+    def test_rejects_invalid_percent(self, percent: str) -> None:
         with pytest.raises(ValueError, match="discount_percent"):
-            Coupon("BAD", percent)
+            Coupon("BAD", Decimal(percent))
 
 
 class TestRide:
@@ -41,33 +54,33 @@ class TestRide:
 
     def test_complete_sets_status_and_fare(self) -> None:
         ride = self.make_ride()
-        ride.complete(50.0)
+        ride.complete(Decimal("50.00"))
         assert ride.status is RideStatus.COMPLETED
-        assert ride.fare == 50.0
+        assert ride.fare == Decimal("50.00")
 
     def test_cannot_complete_twice(self) -> None:
         ride = self.make_ride()
-        ride.complete(50.0)
+        ride.complete(Decimal("50.00"))
         with pytest.raises(ValueError, match="already completed"):
-            ride.complete(60.0)
+            ride.complete(Decimal("60.00"))
 
     def test_cancel_sets_status_and_fee(self) -> None:
         ride = self.make_ride()
-        ride.cancel(20.0)
+        ride.cancel(Decimal("20.00"))
         assert ride.status is RideStatus.CANCELLED
-        assert ride.fare == 20.0
+        assert ride.fare == Decimal("20.00")
 
     def test_cannot_complete_cancelled_ride(self) -> None:
         ride = self.make_ride()
-        ride.cancel(20.0)
+        ride.cancel(Decimal("20.00"))
         with pytest.raises(ValueError, match="already cancelled"):
-            ride.complete(50.0)
+            ride.complete(Decimal("50.00"))
 
     def test_cannot_cancel_completed_ride(self) -> None:
         ride = self.make_ride()
-        ride.complete(50.0)
+        ride.complete(Decimal("50.00"))
         with pytest.raises(ValueError, match="already completed"):
-            ride.cancel(20.0)
+            ride.cancel(Decimal("20.00"))
 
 
 class TestDriver:

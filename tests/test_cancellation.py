@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import pytest
 
 from cancellation import FlatCancellationFee
@@ -9,15 +11,17 @@ def make_ride() -> Ride:
 
 
 class TestFlatCancellationFee:
-    def test_default_fee_is_twenty(self) -> None:
-        assert FlatCancellationFee().fee_for(make_ride()) == 20.0
+    def test_default_fee_is_twenty_rupees(self) -> None:
+        assert FlatCancellationFee().fee_for(make_ride()) == Decimal("20.00")
 
-    def test_custom_amount(self) -> None:
-        assert FlatCancellationFee(35.0).fee_for(make_ride()) == 35.0
+    def test_custom_amount_is_rounded_to_the_paisa(self) -> None:
+        fee = FlatCancellationFee(Decimal("35.005")).fee_for(make_ride())
+        assert fee == Decimal("35.01")
+        assert fee.as_tuple().exponent == -2
 
     def test_zero_fee_allowed(self) -> None:
-        assert FlatCancellationFee(0).fee_for(make_ride()) == 0
+        assert FlatCancellationFee(Decimal("0")).fee_for(make_ride()) == Decimal("0.00")
 
     def test_negative_fee_rejected(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):
-            FlatCancellationFee(-1)
+            FlatCancellationFee(Decimal("-1"))
