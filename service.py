@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Dict, List, Mapping, Optional, Sequence
 
+from cancellation import CancellationFeePolicy, FlatCancellationFee
 from matching import MatchingStrategy
 from models import CarType, Coupon, Driver, Location, Ride, RideStatus, User
 from pricing import PricingStrategy
@@ -61,6 +62,7 @@ class RideService:
         search_radius: float = 5.0,
         car_type_fallbacks: Mapping[CarType, Sequence[CarType]] = DEFAULT_CAR_TYPE_FALLBACKS,
         clock: Callable[[], datetime] = datetime.now,
+        cancellation_policy: CancellationFeePolicy = FlatCancellationFee(),
     ) -> None:
         if search_radius <= 0:
             raise ValueError("search_radius must be positive")
@@ -69,6 +71,7 @@ class RideService:
         self._search_radius = search_radius
         self._car_type_fallbacks = dict(car_type_fallbacks)
         self._clock = clock
+        self._cancellation_policy = cancellation_policy
         self._users: Dict[str, User] = {}
         self._drivers: Dict[str, Driver] = {}
         self._rides: Dict[str, Ride] = {}
@@ -138,6 +141,16 @@ class RideService:
         driver.location = ride.drop
         driver.is_available = True
         return fare
+
+    def cancel_ride(self, ride_id: str) -> float:
+        """Cancel an ongoing ride and return the fee charged. Coupons do not
+        apply to cancellation fees. The driver is freed where they are."""
+        ride = self._get_ongoing_ride(ride_id)
+        fee = self._cancellation_policy.fee_for(ride)
+        ride.cancel(fee)
+        ride.coupon_code = None
+        self._get_driver(ride.driver_id).is_available = True
+        return fee
 
     # History (oldest booking first; status=None returns every ride)
 

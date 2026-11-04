@@ -81,6 +81,12 @@ class Ride:
         self.status = RideStatus.COMPLETED
         self.fare = fare
 
+    def cancel(self, fee: float) -> None:
+        if self.status is not RideStatus.ONGOING:
+            raise ValueError(f"Ride {self.id} is already {self.status.value}")
+        self.status = RideStatus.CANCELLED
+        self.fare = fee
+
 
 @dataclass(frozen=True)
 class Coupon:

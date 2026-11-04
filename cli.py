@@ -1,63 +1,75 @@
 """Interactive CLI for the ride-hailing service.
 
-build_service() is the composition root: the only place that chooses concrete
-strategies. Bonus features (surge pricing, highest-rated matching) are wired
-in here or swapped at runtime, without touching the service.
+build_service() is the composition root: the only place that picks concrete
+strategies and the service class. Swapping in surge pricing or highest-rated
+matching is a change to this function only.
 
-Run:  python cli.py        then type `help`, or `demo` for a scripted walkthrough.
+Run:  python cli.py    then type `help`, or `demo` for a scripted walkthrough.
 """
 
 from __future__ import annotations
 
 import cmd
-from typing import List
+from datetime import datetime
+from typing import List, Optional
 
 from matching import NearestDriverStrategy
-from models import Car, CarType, FlatCoupon, Location, PercentageCoupon, Ride
-from pricing import TieredPricing
+from models import CarType, Coupon, Location, Ride, RideStatus
+from pricing import TieredPricingStrategy
 from service import RideService, RideServiceError
+from thread_safe_service import ThreadSafeRideService
 
 DEMO_SCRIPT = [
     "add_user Asha",
     "add_user Rohan",
-    "add_driver Ravi MH12-1111 hatchback 1 1",
-    "add_driver Sunil MH12-2222 sedan 2 2",
-    "add_driver Meena MH12-3333 sedan 30 30",
-    "drivers",
+    "add_user Meera",
+    "add_driver Ravi hatchback 1 1 4.6",
+    "add_driver Sunil sedan 2 2 4.9",
+    "add_driver Kiran sedan 30 30 4.2",
     "book U1 0 0 10 0 hatchback",
     "book U2 0 0 3 0 hatchback",
-    "add_coupon SAVE20 percent 20 15",
-    "apply_coupon R1 SAVE20",
+    "add_coupon SAVE10 10",
+    "add_coupon OLD20 20 2020-01-01",
+    "apply_coupon R1 OLD20",
+    "apply_coupon R1 NOPE",
+    "apply_coupon R1 SAVE10",
     "end R1",
     "end R2",
-    "end R1",
-    "book U2 50 50 51 50 sedan",
+    "book U3 50 50 51 50 sedan",
     "move D3 50 51",
-    "book U2 50 50 51 50 sedan",
+    "book U3 50 50 51 50 sedan",
+    "cancel R3",
     "end R3",
-    "delete_coupon SAVE20",
-    "history U1",
-    "history U2",
+    "history user U1",
+    "history user U2 completed",
+    "history user U3 cancelled",
+    "history driver D2",
+    "delete_coupon SAVE10",
+    "delete_coupon SAVE10",
 ]
 
 
 def build_service() -> RideService:
-    return RideService(pricing=TieredPricing(), matching=NearestDriverStrategy(), search_radius=5.0)
+    return ThreadSafeRideService(
+        pricing=TieredPricingStrategy(),
+        matching=NearestDriverStrategy(),
+        search_radius=5.0,
+    )
 
 
-def _split(line: str, expected: int, usage: str) -> List[str]:
+def _split(line: str, usage: str, required: int, optional: int = 0) -> List[str]:
     args = line.split()
-    if len(args) != expected:
+    if not required <= len(args) <= required + optional:
         raise ValueError(f"usage: {usage}")
     return args
 
 
-def _car_type(value: str) -> CarType:
+def _choice(enum_type, value: str):
     try:
-        return CarType(value.lower())
+        return enum_type(value.lower())
     except ValueError:
-        choices = ", ".join(c.value for c in CarType)
-        raise ValueError(f"unknown car type {value!r} (choose from {choices})") from None
+        choices = ", ".join(member.value for member in enum_type)
+        raise ValueError(f"unknown value {value!r} (choose from {choices})") from None
 
 
 def _location(x: str, y: str) -> Location:
@@ -67,13 +79,13 @@ def _location(x: str, y: str) -> Location:
 def _format_ride(ride: Ride) -> str:
     car = ride.requested_car_type.value
     if ride.is_upgraded:
-        car += f" -> upgraded to {ride.assigned_car_type.value}"
+        car += f" (upgraded to {ride.assigned_car_type.value})"
     fare = f"Rs {ride.fare:.2f}" if ride.fare is not None else "-"
     coupon = f", coupon {ride.coupon_code}" if ride.coupon_code else ""
     return (
-        f"{ride.id}: driver {ride.driver_id}, ({ride.pickup.x:g},{ride.pickup.y:g}) -> "
-        f"({ride.drop.x:g},{ride.drop.y:g}), {ride.distance:.2f} km, {car}, "
-        f"{ride.status.value}, fare {fare}{coupon}"
+        f"{ride.id}: user {ride.user_id}, driver {ride.driver_id}, "
+        f"({ride.pickup.x:g},{ride.pickup.y:g}) -> ({ride.drop.x:g},{ride.drop.y:g}), "
+        f"{ride.distance:.2f} km, {car}, {ride.status.value}, fare {fare}{coupon}"
     )
 
 
@@ -97,84 +109,88 @@ class RideHailingCLI(cmd.Cmd):
 
     def do_add_user(self, line: str) -> None:
         """add_user NAME"""
-        (name,) = _split(line, 1, "add_user NAME")
+        (name,) = _split(line, "add_user NAME", 1)
         user = self.service.register_user(name)
         print(f"Registered user {user.id} ({user.name})")
 
     def do_add_driver(self, line: str) -> None:
-        """add_driver NAME CAR_NUMBER hatchback|sedan X Y"""
-        name, number, car_type, x, y = _split(line, 5, "add_driver NAME CAR_NUMBER hatchback|sedan X Y")
-        driver = self.service.register_driver(name, Car(number, _car_type(car_type)), _location(x, y))
-        print(f"Registered driver {driver.id} ({driver.name}, {driver.car.car_type.value}) at ({x}, {y})")
+        """add_driver NAME hatchback|sedan X Y RATING"""
+        name, car_type, x, y, rating = _split(line, "add_driver NAME hatchback|sedan X Y RATING", 5)
+        driver = self.service.register_driver(name, _choice(CarType, car_type), _location(x, y), float(rating))
+        print(f"Registered driver {driver.id} ({driver.name}, {driver.car_type.value}, rating {driver.rating:g}) at ({x}, {y})")
 
     def do_move(self, line: str) -> None:
         """move DRIVER_ID X Y  - update a driver's location"""
-        driver_id, x, y = _split(line, 3, "move DRIVER_ID X Y")
+        driver_id, x, y = _split(line, "move DRIVER_ID X Y", 3)
         driver = self.service.update_driver_location(driver_id, _location(x, y))
         print(f"Driver {driver.id} is now at ({x}, {y})")
-
-    def do_drivers(self, line: str) -> None:
-        """drivers  - list all drivers"""
-        for d in self.service.list_drivers():
-            status = "available" if d.is_available else "on a ride"
-            print(f"{d.id}: {d.name}, {d.car.car_type.value} {d.car.number}, "
-                  f"at ({d.location.x:g},{d.location.y:g}), rating {d.rating}, {status}")
 
     def do_book(self, line: str) -> None:
         """book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback|sedan"""
         user_id, px, py, dx, dy, car_type = _split(
-            line, 6, "book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback|sedan"
+            line, "book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback|sedan", 6
         )
-        ride = self.service.book_ride(user_id, _location(px, py), _location(dx, dy), _car_type(car_type))
+        ride = self.service.book_ride(user_id, _location(px, py), _location(dx, dy), _choice(CarType, car_type))
         print(f"Booked {_format_ride(ride)}")
 
     def do_end(self, line: str) -> None:
         """end RIDE_ID  - finish a ride and show the fare"""
-        (ride_id,) = _split(line, 1, "end RIDE_ID")
+        (ride_id,) = _split(line, "end RIDE_ID", 1)
         fare = self.service.end_ride(ride_id)
-        print(f"Ride {ride_id} completed. Base Rs {fare.base_fare:.2f}, "
-              f"discount Rs {fare.discount:.2f}, total Rs {fare.total:.2f}")
+        print(
+            f"Ride {ride_id} completed. Base Rs {fare.base_fare:.2f}, "
+            f"discount Rs {fare.discount:.2f}, total Rs {fare.total:.2f}"
+        )
+
+    def do_cancel(self, line: str) -> None:
+        """cancel RIDE_ID  - cancel an ongoing ride and charge the cancellation fee"""
+        (ride_id,) = _split(line, "cancel RIDE_ID", 1)
+        fee = self.service.cancel_ride(ride_id)
+        print(f"Ride {ride_id} cancelled. Cancellation fee Rs {fee:.2f}")
 
     def do_history(self, line: str) -> None:
-        """history USER_ID"""
-        (user_id,) = _split(line, 1, "history USER_ID")
-        rides = self.service.ride_history(user_id)
+        """history user|driver ID [ongoing|completed|cancelled]"""
+        args = _split(line, "history user|driver ID [ongoing|completed|cancelled]", 2, optional=1)
+        kind, owner_id = args[0].lower(), args[1]
+        status: Optional[RideStatus] = _choice(RideStatus, args[2]) if len(args) == 3 else None
+        if kind == "user":
+            rides = self.service.user_history(owner_id, status)
+        elif kind == "driver":
+            rides = self.service.driver_history(owner_id, status)
+        else:
+            raise ValueError("usage: history user|driver ID [ongoing|completed|cancelled]")
         if not rides:
-            print(f"No rides for {user_id}")
+            print(f"No rides for {owner_id}")
         for ride in rides:
             print(_format_ride(ride))
 
     def do_add_coupon(self, line: str) -> None:
-        """add_coupon CODE flat AMOUNT  |  add_coupon CODE percent PERCENT [MAX_DISCOUNT]"""
-        args = line.split()
-        if len(args) == 3 and args[1] == "flat":
-            coupon = FlatCoupon(args[0], float(args[2]))
-        elif len(args) in (3, 4) and args[1] == "percent":
-            max_discount = float(args[3]) if len(args) == 4 else None
-            coupon = PercentageCoupon(args[0], float(args[2]), max_discount)
-        else:
-            raise ValueError("usage: add_coupon CODE flat AMOUNT | add_coupon CODE percent PERCENT [MAX]")
+        """add_coupon CODE PERCENT [EXPIRES_AT]  - EXPIRES_AT as YYYY-MM-DD or YYYY-MM-DDTHH:MM"""
+        args = _split(line, "add_coupon CODE PERCENT [EXPIRES_AT]", 2, optional=1)
+        expires_at = datetime.fromisoformat(args[2]) if len(args) == 3 else None
+        coupon = Coupon(args[0], float(args[1]), expires_at)
         self.service.add_coupon(coupon)
-        print(f"Added coupon {coupon.code}")
+        expiry = f", expires {expires_at:%Y-%m-%d %H:%M}" if expires_at else ""
+        print(f"Added coupon {coupon.code} ({coupon.discount_percent:g}% off{expiry})")
 
     def do_delete_coupon(self, line: str) -> None:
         """delete_coupon CODE"""
-        (code,) = _split(line, 1, "delete_coupon CODE")
+        (code,) = _split(line, "delete_coupon CODE", 1)
         self.service.delete_coupon(code)
         print(f"Deleted coupon {code}")
 
     def do_apply_coupon(self, line: str) -> None:
-        """apply_coupon RIDE_ID CODE  - applied when the ride ends"""
-        ride_id, code = _split(line, 2, "apply_coupon RIDE_ID CODE")
+        """apply_coupon RIDE_ID CODE  - the discount is taken when the ride ends"""
+        ride_id, code = _split(line, "apply_coupon RIDE_ID CODE", 2)
         self.service.apply_coupon(ride_id, code)
         print(f"Coupon {code} applied to {ride_id}")
 
     def do_demo(self, line: str) -> None:
         """demo  - run a scripted walkthrough on a fresh service"""
-        demo_cli = RideHailingCLI(build_service())
+        demo = RideHailingCLI(build_service())
         for command in DEMO_SCRIPT:
             print(f"\nride> {command}")
-            demo_cli.onecmd(command)
+            demo.onecmd(command)
 
     def do_quit(self, line: str) -> bool:
         """quit  - exit"""
