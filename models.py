@@ -1,15 +1,14 @@
 """Domain models for the ride-hailing service.
 
-Models hold state and guard their own invariants. Anything that can vary
-(how fares are priced, how drivers are matched) lives in strategies that
-operate on these models, so new behaviour is added without editing them.
+Models hold state and guard their own invariants. Behaviour that varies
+(pricing, matching) lives in strategies that read these models, so new
+behaviour is added as new strategy classes rather than edits here.
 """
 
 from __future__ import annotations
 
 import math
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Optional
@@ -21,7 +20,7 @@ class CarType(Enum):
 
 
 class RideStatus(Enum):
-    BOOKED = "booked"
+    ONGOING = "ongoing"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
 
@@ -41,20 +40,18 @@ class User:
     name: str
 
 
-@dataclass(frozen=True)
-class Car:
-    number: str
-    car_type: CarType
-
-
 @dataclass
 class Driver:
     id: str
     name: str
-    car: Car
+    car_type: CarType
     location: Location
-    rating: float = 5.0
+    rating: float
     is_available: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.rating <= 5:
+            raise ValueError("rating must be between 0 and 5")
 
 
 @dataclass
@@ -66,11 +63,9 @@ class Ride:
     drop: Location
     requested_car_type: CarType
     assigned_car_type: CarType
-    status: RideStatus = RideStatus.BOOKED
+    status: RideStatus = RideStatus.ONGOING
     coupon_code: Optional[str] = None
     fare: Optional[float] = None
-    created_at: datetime = field(default_factory=datetime.now)
-    ended_at: Optional[datetime] = None
 
     @property
     def distance(self) -> float:
@@ -81,47 +76,24 @@ class Ride:
         return self.requested_car_type != self.assigned_car_type
 
     def complete(self, fare: float) -> None:
-        self._close(RideStatus.COMPLETED, fare)
-
-    def cancel(self, fee: float) -> None:
-        self._close(RideStatus.CANCELLED, fee)
-
-    def _close(self, status: RideStatus, amount: float) -> None:
-        if self.status is not RideStatus.BOOKED:
+        if self.status is not RideStatus.ONGOING:
             raise ValueError(f"Ride {self.id} is already {self.status.value}")
-        self.status = status
-        self.fare = amount
-        self.ended_at = datetime.now()
+        self.status = RideStatus.COMPLETED
+        self.fare = fare
 
 
-@dataclass
-class Coupon(ABC):
+@dataclass(frozen=True)
+class Coupon:
     code: str
-
-    @abstractmethod
-    def discount_for(self, fare: float) -> float:
-        """Return the amount to subtract from the fare."""
-
-
-@dataclass
-class FlatCoupon(Coupon):
-    amount: float
-
-    def discount_for(self, fare: float) -> float:
-        return min(self.amount, fare)
-
-
-@dataclass
-class PercentageCoupon(Coupon):
-    percent: float
-    max_discount: Optional[float] = None
+    discount_percent: float
+    expires_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
-        if not 0 < self.percent <= 100:
-            raise ValueError("percent must be in (0, 100]")
+        if not 0 < self.discount_percent <= 100:
+            raise ValueError("discount_percent must be in (0, 100]")
+
+    def is_expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and now >= self.expires_at
 
     def discount_for(self, fare: float) -> float:
-        discount = fare * self.percent / 100
-        if self.max_discount is not None:
-            discount = min(discount, self.max_discount)
-        return min(discount, fare)
+        return round(fare * self.discount_percent / 100, 2)
