@@ -1,162 +1,172 @@
 # Ride Hailing Service
 
-An in-memory ride-hailing backend (users, drivers, booking, pricing, coupons,
-history) with a command-line demo. Built in Python using only the standard
-library; `pytest` is the only development dependency.
+A small in-memory backend for a ride-hailing app, with a command-line interface.
+You can register users and drivers, book rides within a radius, end or cancel
+them, apply coupons and see ride history. Plain Python, standard library only;
+pytest is used for the tests.
 
-The design rule throughout is the **Open/Closed Principle**: pricing, driver
-matching and cancellation fees are strategies injected into the service, so
-new behaviour is added as new classes, not by rewriting existing logic.
+## How to run
 
-## Quick start
-
-Requires Python 3.9+ (developed and tested on 3.12).
+You need Python 3.9 or newer (`python --version` on Windows, `python3 --version`
+on macOS/Linux) and Git.
 
 ```bash
+git clone https://github.com/prajaktaRSA/quick-comm-health.git
+cd quick-comm-health
+```
+
+Create a virtual environment and install pytest:
+
+```bash
+# Windows (PowerShell or Command Prompt)
 python -m venv .venv
-.venv\Scripts\python -m pip install -r requirements-dev.txt   # Windows
-# .venv/bin/python -m pip install -r requirements-dev.txt     # macOS / Linux
+.venv\Scripts\python -m pip install -r requirements-dev.txt
 
-.venv\Scripts\python -m pytest            # run the test suite
-.venv\Scripts\python cli.py               # start the CLI (nearest-driver matching)
-.venv\Scripts\python cli.py --matching highest-rated
+# macOS / Linux
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
 ```
 
-In the CLI, type `demo` for a scripted walkthrough of every feature, or `help`
-for the command list:
+Run the tests (you should see `149 passed`):
 
-| Command | Purpose |
-|---|---|
-| `add_user NAME` | Register a user (ids `U1`, `U2`, ...) |
-| `add_driver NAME hatchback\|sedan X Y RATING` | Register a driver (ids `D1`, ...) |
-| `move DRIVER_ID X Y` | Update a driver's location |
-| `book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback\|sedan [COUPON]` | Book the best driver within the search radius, optionally with a coupon |
-| `end RIDE_ID` | Complete a ride and show base fare, discount and total |
-| `cancel RIDE_ID` | Cancel an ongoing ride and charge the cancellation fee |
-| `history user\|driver ID [ongoing\|completed\|cancelled]` | Ride history, optionally filtered by status |
-| `add_coupon CODE PERCENT [YYYY-MM-DD]` | Add a percentage coupon with optional expiry |
-| `delete_coupon CODE` | Remove a coupon |
-
-Errors (unknown ids, no driver in range, expired coupons, bad input) are
-printed as `Error: ...` and the CLI keeps running.
-
-## Design
-
-```
-cli.py                CLI + build_service(): the only place concrete classes are chosen
-  └─ service.py         RideService: in-memory dicts, booking, fares, coupons, history; one lock
-       ├─ pricing.py      PricingStrategy        ← TieredPricingStrategy
-       ├─ matching.py     MatchingStrategy       ← NearestDriverStrategy, HighestRatedDriverStrategy
-       ├─ cancellation.py CancellationFeePolicy  ← FlatCancellationFee
-       ├─ models.py       User, Driver, Ride, Coupon, Location, CarType, RideStatus
-       └─ money.py        to_money(): Decimal rupees rounded half-up to the paisa
+```bash
+.venv\Scripts\python -m pytest        # Windows
+.venv/bin/python -m pytest            # macOS / Linux
 ```
 
-- **Strategies via dependency injection.** `RideService(pricing, matching, ...)`
-  depends only on the abstract base classes. Tests inject other strategies
-  (flat pricing, highest-rated matching, free cancellation for upgrades) to
-  prove the service uses whatever it is given.
-- **Matching is split in two.** The service applies the rules every strategy
-  shares (driver available, within radius, acceptable car type); the strategy
-  only chooses among eligible drivers.
-- **The upgrade rule is data.** `CAR_TYPE_FALLBACKS` maps a requested type to
-  the types tried in order (`hatchback → hatchback, sedan`). Pricing uses the
-  ride's *requested* car type, which is what charges an upgraded ride the
-  hatchback price.
-- **Thread safety is built in.** Every public `RideService` method is decorated
-  with `@_synchronized`, which holds one `threading.Lock`, so each operation is
-  atomic and two users can never book the same driver.
-- **Tiered pricing is configuration.** Tiers, minimum fare and per-car-type
-  multipliers are constructor arguments of `TieredPricingStrategy`.
-- **Money is `Decimal`, never `float`.** Fares, discounts, fees and coupon
-  percentages are exact decimals, rounded to the paisa with `ROUND_HALF_UP` in
-  one place (`money.py`). With floats, 12.5% off ₹69.00 came out as ₹8.62
-  instead of ₹8.63. Distance is the only float input, converted once.
-- **Models guard their own state.** A ride can only be completed or cancelled
-  while `ONGOING`; coupons validate their percentage; drivers validate rating.
+Start the CLI:
 
-### Pricing
+```bash
+.venv\Scripts\python cli.py                              # Windows
+.venv/bin/python cli.py                                  # macOS / Linux
+.venv\Scripts\python cli.py --matching highest-rated     # pick the matching strategy
+```
 
-| Distance slab | Rate |
-|---|---|
-| First 2 km | ₹10/km |
-| Next 3 km (2–5 km) | ₹8/km |
-| Beyond 5 km | ₹5/km |
+At the `ride>` prompt, type `demo` for a scripted walkthrough of everything,
+`help` for the command list, and `quit` to exit. A short session:
 
+```text
+ride> add_user Asha
+Registered user U1 (Asha)
+ride> add_driver Ravi hatchback 1 1 4.6
+Registered driver D1 (Ravi, hatchback, rating 4.6) at (1, 1)
+ride> add_coupon SAVE10 10
+Added coupon SAVE10 (10% off)
+ride> book U1 0 0 10 0 hatchback SAVE10
+Booked R1: user U1, driver D1, (0,0) -> (10,0), 10.00 km, hatchback, ongoing, fare -, coupon SAVE10
+ride> end R1
+Ride R1 completed. Base Rs 55.20, discount Rs 5.52, total Rs 49.68
+```
 
-## Bonus features
+Other commands: `move DRIVER_ID X Y`, `cancel RIDE_ID`,
+`history user|driver ID [ongoing|completed|cancelled]`, `delete_coupon CODE`,
+and `add_coupon CODE PERCENT YYYY-MM-DD` for a coupon with an expiry date.
 
-| Feature | Status | How |
-|---|---|---|
-| Concurrency safety | Done | Every public `RideService` method runs under one `threading.Lock` via the `@_synchronized` decorator. Tests show 20 simultaneous bookings of one driver produce exactly one ride. |
-| Ride cancellation with fee | Done | New `CancellationFeePolicy` (default flat ₹20), `Ride.cancel()` and `RideService.cancel_ride()`. Purely additive: no existing lines changed. |
-| Configurable matching | Done | New `HighestRatedDriverStrategy` (ties go to the nearest driver), chosen with `cli.py --matching nearest\|highest-rated`. `service.py` was not edited; a further strategy is one more entry in `MATCHING_STRATEGIES`. |
-| Surge pricing | Not implemented | Out of scope by decision. A demand/supply-based multiplier would be a new `SurgePolicy` injected into the service and evaluated at booking, plus a `PricingStrategy` that applies it. |
-
+If `python` isn't recognised on Windows, use `py -m venv .venv` instead; the
+`.venv\Scripts\python` commands then work as written. There's no need to
+activate the virtual environment (PowerShell often blocks that anyway).
 
 ## Assumptions
 
-1. **Distance is Euclidean** on the (x, y) plane, in km. A driver exactly on
-   the search radius (default 5 km) is eligible.
-2. **The fare is calculated when the ride ends**, from the pickup and drop
-   coordinates given at booking.
-3. **The cancellation fee is a flat ₹20.** Only ongoing rides can be cancelled;
-   coupons do not reduce the fee; the driver is freed at their current location.
-4. **Coupons are applied when starting a ride** (`book ... COUPON`). Unknown or
-   expired coupons return an error without crashing, and the ride is not booked.
-   The discount is taken from the fare when the ride ends; a coupon that expires
-   or is deleted in between is dropped, so it never blocks ending a ride.
-5. **The ₹50 minimum applies before coupons.** A 10% coupon on a ₹50 ride
-   charges ₹45.
-6. **Upgrades go one way:** a hatchback request may get a sedan; a sedan request
-   never gets a hatchback. A hatchback within range is always preferred over a
-   nearer sedan.
-7. **One ongoing ride per user.** A driver is unavailable while on a ride and
-   moves to the drop location when it is completed.
-8. Coupons are percentage discounts. Ids are sequential per type (`U1`, `D1`, `R1`)
-   because storage is in-memory and nothing is deleted.
+- Locations are (x, y) points in km and distance is a straight line. A driver
+  exactly on the 5 km search radius counts as in range.
+- Pickup and drop are given when booking; the fare is worked out when the ride ends.
+- Pricing tiers: first 2 km at ₹10/km, km 3–5 at ₹8/km, beyond that ₹5/km.
+  Hatchbacks cost 20% less than sedans. Every ride costs at least ₹50.
+- The ₹50 minimum applies before the coupon, so 10% off a ₹50 ride is ₹45.
+- Coupons are a percentage off, with an optional expiry date, and are given
+  when booking. An unknown or expired coupon is rejected and nothing is booked.
+  If a coupon expires or is deleted while the ride is in progress, the ride
+  ends at full price instead of failing.
+- If no hatchback is free, the rider gets a sedan at the hatchback price. A
+  sedan request never gets a hatchback.
+- A user can have one ongoing ride at a time. When a ride ends, the driver's
+  location becomes the drop point.
+- Cancelling costs a flat ₹20, only ongoing rides can be cancelled, and coupons
+  don't reduce the fee.
 
-## Testing
+## Key design decisions and trade-offs
 
-```bash
-.venv\Scripts\python -m pytest -v
-```
+**Strategies for the parts that change.** Pricing, driver matching and the
+cancellation fee are each an abstract class with one or more implementations,
+passed into `RideService` when it's created. Switching from nearest-driver to
+highest-rated matching is a command-line flag and doesn't touch the booking
+code. The trade-off is a few more small classes than a single service with
+if/else branches.
 
-148 tests, all passing:
+**Matching is split in two.** The service decides which drivers are eligible
+(free, in range, right car type) and the strategy only picks one of them. That
+keeps every strategy tiny and means the eligibility rules can't drift between
+strategies.
 
-| File | Covers |
-|---|---|
-| `test_pricing.py` | Every tier boundary, minimum fare, hatchback rate, free upgrade, Decimal fares rounded half-up, custom/invalid configuration |
-| `test_models.py` | Coupon discount (including half-paisa cases such as 12.5% of ₹69.00 = ₹8.63) and expiry, ride state transitions, rating validation |
-| `test_matching.py` | Nearest and highest-rated selection, their tie-breaks, no candidates |
-| `test_cancellation.py` | Flat fee default, custom and invalid amounts |
-| `test_service.py` | Registration, booking and upgrades, radius edge, no-driver messages, end ride, coupons at booking (valid, unknown, expired, deleted, expiring mid-ride), cancellation, history filters, injected strategies |
-| `test_concurrency.py` | 20 threads booking one driver → exactly one ride; concurrent ends and cancels charge once; unique ids under concurrent registration |
-| `test_cli.py` | Each command, `--matching` option, error messages for bad input, the full demo |
+**The free upgrade is a pricing rule, not a matching hack.** A ride stores both
+the car type that was requested and the one that was assigned, and the fare is
+always based on the requested type. Matching can hand out a sedan without
+knowing anything about price. The upgrade order itself is a small lookup table.
 
-The concurrency tests were checked against the unlocked `RideService`, where
-they fail (all 20 threads book the same driver), so they detect the race they
-are meant to.
+**Money is `Decimal`, never `float`.** All amounts are rounded to the paisa,
+half up, in one helper (`money.py`). See the AI notes below for why.
 
-## AI usage notes
+**One lock around every service method.** Two people booking the same driver
+at the same moment get exactly one ride (there's a test that fires 20
+simultaneous bookings at one driver). It's simple and obviously correct, but it
+means every operation waits for every other one. That's fine in memory; with
+real traffic I'd lock per driver or rely on database transactions.
 
-This project was built as an AI-assisted pair-programming exercise:
+**CLI and in-memory dicts rather than an API and a database.** Quicker to build
+and demo in two hours, and the service has no idea it's behind a CLI, so an
+HTTP layer could sit on top of it. Ids are simple counters (`U1`, `D1`, `R1`)
+because nothing is ever deleted.
 
-- **The developer acted as architect.** They wrote the requirements, the
-  Open/Closed and dependency-injection constraints, the commit plan, and the
-  assumptions, and reviewed and committed each step.
-- **The AI assistant (Claude Code) acted as coder.** It generated one file or
-  feature per step, with tests, and stopped for review before the next step.
-- **Verification was not left to the AI's word.** Every fare in the tests was
-  hand-calculated from the tier table; the concurrency tests were run against
-  the unsynchronised service to show they fail without the lock; the full suite
-  was run after every step.
-- **Design decisions made during the session:** pricing uses the requested car
-  type (so upgrades need no special pricing code); coupon validity is checked
-  both when applied and when the ride ends; cancellation was added as an
-  optional injected policy rather than a subclass, to avoid a separate class
-  for every combination of bonus features. A review pass then removed
-  redundant code: a thread-safe subclass of pass-through wrappers was folded
-  into `RideService` as one lock decorator, a second way of applying coupons
-  was dropped in favour of applying them at booking, and a constructor option
-  used only by tests was replaced by a constant.
+**Surge pricing was left out on purpose.** Demand and supply need to be
+measured when the ride is booked, not when it ends, so it touches booking as
+well as pricing. With the time available I chose to finish the other bonuses
+properly instead.
+
+## What I'd do with more time
+
+- **Surge pricing:** a pluggable policy that counts open requests and free
+  drivers near the pickup at booking time, stores the multiplier on the ride,
+  and a pricing strategy that applies it.
+- **A proper `Cab` entity** (registration number, car type) instead of the car
+  type living on the driver.
+- **Finer-grained locking**, and a spatial index for finding nearby drivers
+  instead of scanning all of them.
+- **Persistence and an HTTP API** in front of the same service.
+- **A fuller ride lifecycle** (driver arriving, trip started), so cancellation
+  fees could depend on how far along the ride is.
+- **Richer coupons:** flat amounts, caps, per-user limits.
+- **Fail fast on configuration:** check at start-up that every car type has a
+  price and an upgrade rule. Today a missing upgrade rule only shows up on the
+  first booking.
+
+## How I used AI
+
+I used Claude Code as a pair programmer. I wrote the brief: the requirements,
+the rule that bonus features should be added without rewriting existing code,
+strategies passed into the service, no dead code, small steps, and tests for
+the pricing engine. I asked for one file or feature at a time and reviewed
+and committed each step before moving on.
+
+I also asked it to check its own work rather than taking it on trust: whether
+anything was hard-coded to pass the tests, and whether the tests would fail if
+the logic were broken. It answered by deliberately breaking the code in a
+throwaway copy and showing which tests failed. That turned up a concurrency
+test that couldn't fail, which we then fixed.
+
+Two things I rejected and had rewritten:
+
+**Coupons.** The first version booked the ride and then had a separate
+"apply coupon" step for a ride already in progress. When I re-read the
+problem statement, it says the coupon is applied *when starting* the ride. I
+had it changed so the coupon is passed with the booking and checked before a
+driver is assigned. An invalid or expired coupon now books nothing, and the
+separate apply step is gone.
+
+**Floats for money.** Fares and discounts were originally floats rounded with
+Python's `round()`. I asked how the discounted price was actually calculated.
+Checking it showed that 12.5% off ₹69.00 came out as ₹8.62 instead of ₹8.63,
+because floats can't store most decimal fractions exactly and `round()` rounds
+halves to even. The existing tests hadn't caught it because none of them hit
+an exact half paisa. I had all money switched to `Decimal` with half-up
+rounding in a single place, and added tests for those half-paisa cases.

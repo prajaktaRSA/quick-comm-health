@@ -1,3 +1,4 @@
+import io
 from typing import List
 
 import pytest
@@ -135,6 +136,13 @@ def test_demo_runs_every_feature(cli: RideHailingCLI, capsys: pytest.CaptureFixt
         "Error: Coupon SAVE10 not found",
     ]:
         assert expected in out
+
+
+def test_piped_input_with_byte_order_mark(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    cli.use_rawinput = False
+    cli.stdin = io.StringIO("﻿add_user Asha\nquit\n")
+    cli.cmdloop()
+    assert "Registered user U1 (Asha)" in capsys.readouterr().out
 
 
 def test_quit_stops_the_loop(cli: RideHailingCLI) -> None:

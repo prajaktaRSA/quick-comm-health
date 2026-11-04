@@ -135,6 +135,10 @@ class RideHailingCLI(cmd.Cmd):
             print(f"Error: {error}")
             return False
 
+    def precmd(self, line: str) -> str:
+        # Windows PowerShell 5.1 starts piped input with a byte-order mark; drop it.
+        return line.lstrip("﻿")
+
     def emptyline(self) -> bool:
         return False
 
