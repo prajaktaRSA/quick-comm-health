@@ -4,8 +4,8 @@ from typing import Optional, Sequence
 import pytest
 
 from cancellation import CancellationFeePolicy
-from matching import MatchingStrategy, NearestDriverStrategy
-from models import CarType, Coupon, Driver, Location, Ride, RideStatus
+from matching import HighestRatedDriverStrategy, NearestDriverStrategy
+from models import CarType, Coupon, Location, Ride, RideStatus
 from pricing import PricingStrategy, TieredPricingStrategy
 from service import (
     InvalidCouponError,
@@ -162,12 +162,43 @@ class TestBooking:
         with pytest.raises(NotFoundError, match="U99"):
             service.book_ride("U99", ORIGIN, DROP, CarType.SEDAN)
 
-    def test_uses_injected_matching_strategy(self) -> None:
-        class HighestRated(MatchingStrategy):
-            def select_driver(self, candidates: Sequence[Driver], pickup: Location) -> Optional[Driver]:
-                return max(candidates, key=lambda d: d.rating, default=None)
+class TestNoDriverMessage:
+    def test_names_every_car_type_tried(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        with pytest.raises(NoDriverAvailableError, match=r"^No hatchback or sedan available within 5 km$"):
+            service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
+        with pytest.raises(NoDriverAvailableError, match=r"^No sedan available within 5 km$"):
+            service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
 
-        service = RideService(pricing=TieredPricingStrategy(), matching=HighestRated())
+    def test_counts_one_busy_driver_in_range(self, service: RideService) -> None:
+        asha, rohan = service.register_user("Asha"), service.register_user("Rohan")
+        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        service.book_ride(asha.id, ORIGIN, DROP, CarType.SEDAN)
+        with pytest.raises(NoDriverAvailableError, match=r"^No sedan available within 5 km \(1 nearby driver is on a ride\)$"):
+            service.book_ride(rohan.id, ORIGIN, DROP, CarType.SEDAN)
+
+    def test_counts_busy_drivers_of_upgrade_type(self, service: RideService) -> None:
+        users = [service.register_user(name) for name in ("Asha", "Rohan", "Meera")]
+        service.register_driver("Hatch", CarType.HATCHBACK, Location(1, 0), rating=4.5)
+        service.register_driver("Sedan", CarType.SEDAN, Location(2, 0), rating=4.5)
+        service.book_ride(users[0].id, ORIGIN, DROP, CarType.HATCHBACK)
+        service.book_ride(users[1].id, ORIGIN, DROP, CarType.HATCHBACK)  # upgraded to the sedan
+        with pytest.raises(NoDriverAvailableError, match=r"\(2 nearby drivers are on rides\)$"):
+            service.book_ride(users[2].id, ORIGIN, DROP, CarType.HATCHBACK)
+
+    def test_ignores_busy_drivers_out_of_range_or_of_other_types(self, service: RideService) -> None:
+        asha, rohan, meera = (service.register_user(n) for n in ("Asha", "Rohan", "Meera"))
+        service.register_driver("Hatch", CarType.HATCHBACK, Location(1, 0), rating=4.5)
+        service.register_driver("Far sedan", CarType.SEDAN, Location(20, 0), rating=4.5)
+        service.book_ride(asha.id, ORIGIN, DROP, CarType.HATCHBACK)  # busy hatchback nearby
+        service.book_ride(rohan.id, Location(20, 0), DROP, CarType.SEDAN)  # busy sedan far away
+        with pytest.raises(NoDriverAvailableError, match=r"^No sedan available within 5 km$"):
+            service.book_ride(meera.id, ORIGIN, DROP, CarType.SEDAN)
+
+
+class TestBookingConfiguration:
+    def test_uses_injected_matching_strategy(self) -> None:
+        service = RideService(pricing=TieredPricingStrategy(), matching=HighestRatedDriverStrategy())
         user = service.register_user("Asha")
         service.register_driver("Near", CarType.SEDAN, Location(1, 0), rating=3.9)
         best = service.register_driver("Far", CarType.SEDAN, Location(4, 0), rating=4.9)
@@ -240,6 +271,52 @@ class TestCoupons:
         assert (fare.base_fare, fare.discount, fare.total) == (69.0, 6.9, 62.1)
         assert ride.coupon_code == "SAVE10"
         assert ride.fare == 62.1
+
+    def test_coupon_given_at_booking_discounts_fare(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        service.add_coupon(Coupon("SAVE10", 10))
+
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN, coupon_code="SAVE10")
+
+        assert ride.coupon_code == "SAVE10"
+        fare = service.end_ride(ride.id)
+        assert (fare.base_fare, fare.discount, fare.total) == (69.0, 6.9, 62.1)
+
+    def test_coupon_at_booking_works_with_free_upgrade(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=4.5)
+        service.add_coupon(Coupon("SAVE10", 10))
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK, coupon_code="SAVE10")
+        assert ride.is_upgraded
+        assert service.end_ride(ride.id).total == pytest.approx(49.68)  # 55.20 hatchback price - 10%
+
+    @pytest.mark.parametrize(
+        "code, message",
+        [("NOPE", "Coupon NOPE does not exist"), ("OLD", "Coupon OLD has expired")],
+    )
+    def test_invalid_coupon_at_booking_books_nothing(self, service: RideService, code: str, message: str) -> None:
+        user = service.register_user("Asha")
+        driver = service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        service.add_coupon(Coupon("OLD", 10, expires_at=NOW - timedelta(days=1)))
+
+        with pytest.raises(InvalidCouponError, match=message):
+            service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN, coupon_code=code)
+
+        assert driver.is_available
+        assert service.user_history(user.id) == []
+        assert service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN).id == "R1"
+
+    def test_coupon_given_at_booking_expiring_before_end_is_dropped(
+        self, service: RideService, clock: FakeClock
+    ) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        service.add_coupon(Coupon("SOON", 10, expires_at=NOW + timedelta(minutes=30)))
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN, coupon_code="SOON")
+        clock.now = NOW + timedelta(hours=1)
+        assert service.end_ride(ride.id).total == 69.0
+        assert ride.coupon_code is None
 
     def test_coupon_applies_after_minimum_fare(self, service: RideService) -> None:
         user = service.register_user("Asha")

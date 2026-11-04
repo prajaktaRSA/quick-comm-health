@@ -1,19 +1,21 @@
 """Interactive CLI for the ride-hailing service.
 
 build_service() is the composition root: the only place that picks concrete
-strategies and the service class. Swapping in surge pricing or highest-rated
-matching is a change to this function only.
+strategies and the service class. A new matching strategy is one more entry
+in MATCHING_STRATEGIES.
 
-Run:  python cli.py    then type `help`, or `demo` for a scripted walkthrough.
+Run:  python cli.py [--matching nearest|highest-rated]
+      then type `help`, or `demo` for a scripted walkthrough.
 """
 
 from __future__ import annotations
 
+import argparse
 import cmd
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Type
 
-from matching import NearestDriverStrategy
+from matching import HighestRatedDriverStrategy, MatchingStrategy, NearestDriverStrategy
 from models import CarType, Coupon, Location, Ride, RideStatus
 from pricing import TieredPricingStrategy
 from service import RideService, RideServiceError
@@ -26,13 +28,12 @@ DEMO_SCRIPT = [
     "add_driver Ravi hatchback 1 1 4.6",
     "add_driver Sunil sedan 2 2 4.9",
     "add_driver Kiran sedan 30 30 4.2",
-    "book U1 0 0 10 0 hatchback",
-    "book U2 0 0 3 0 hatchback",
     "add_coupon SAVE10 10",
     "add_coupon OLD20 20 2020-01-01",
-    "apply_coupon R1 OLD20",
-    "apply_coupon R1 NOPE",
-    "apply_coupon R1 SAVE10",
+    "book U1 0 0 10 0 hatchback OLD20",
+    "book U1 0 0 10 0 hatchback NOPE",
+    "book U1 0 0 10 0 hatchback SAVE10",
+    "book U2 0 0 3 0 hatchback",
     "end R1",
     "end R2",
     "book U3 50 50 51 50 sedan",
@@ -49,12 +50,31 @@ DEMO_SCRIPT = [
 ]
 
 
-def build_service() -> RideService:
+MATCHING_STRATEGIES: Dict[str, Type[MatchingStrategy]] = {
+    "nearest": NearestDriverStrategy,
+    "highest-rated": HighestRatedDriverStrategy,
+}
+
+
+def build_service(matching: str = "nearest") -> RideService:
+    if matching not in MATCHING_STRATEGIES:
+        raise ValueError(f"unknown matching strategy {matching!r} (choose from {', '.join(MATCHING_STRATEGIES)})")
     return ThreadSafeRideService(
         pricing=TieredPricingStrategy(),
-        matching=NearestDriverStrategy(),
+        matching=MATCHING_STRATEGIES[matching](),
         search_radius=5.0,
     )
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Ride hailing service CLI")
+    parser.add_argument(
+        "--matching",
+        choices=list(MATCHING_STRATEGIES),
+        default="nearest",
+        help="how a driver is chosen among those in range (default: nearest)",
+    )
+    return parser.parse_args(argv)
 
 
 def _split(line: str, usage: str, required: int, optional: int = 0) -> List[str]:
@@ -126,11 +146,13 @@ class RideHailingCLI(cmd.Cmd):
         print(f"Driver {driver.id} is now at ({x}, {y})")
 
     def do_book(self, line: str) -> None:
-        """book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback|sedan"""
-        user_id, px, py, dx, dy, car_type = _split(
-            line, "book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback|sedan", 6
+        """book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback|sedan [COUPON]"""
+        args = _split(line, "book USER_ID PICKUP_X PICKUP_Y DROP_X DROP_Y hatchback|sedan [COUPON]", 6, optional=1)
+        user_id, px, py, dx, dy, car_type = args[:6]
+        coupon_code = args[6] if len(args) == 7 else None
+        ride = self.service.book_ride(
+            user_id, _location(px, py), _location(dx, dy), _choice(CarType, car_type), coupon_code
         )
-        ride = self.service.book_ride(user_id, _location(px, py), _location(dx, dy), _choice(CarType, car_type))
         print(f"Booked {_format_ride(ride)}")
 
     def do_end(self, line: str) -> None:
@@ -180,13 +202,13 @@ class RideHailingCLI(cmd.Cmd):
         print(f"Deleted coupon {code}")
 
     def do_apply_coupon(self, line: str) -> None:
-        """apply_coupon RIDE_ID CODE  - the discount is taken when the ride ends"""
+        """apply_coupon RIDE_ID CODE  - add a coupon to an ongoing ride booked without one"""
         ride_id, code = _split(line, "apply_coupon RIDE_ID CODE", 2)
         self.service.apply_coupon(ride_id, code)
         print(f"Coupon {code} applied to {ride_id}")
 
     def do_demo(self, line: str) -> None:
-        """demo  - run a scripted walkthrough on a fresh service"""
+        """demo  - run a scripted walkthrough on a fresh service with nearest matching"""
         demo = RideHailingCLI(build_service())
         for command in DEMO_SCRIPT:
             print(f"\nride> {command}")
@@ -200,5 +222,12 @@ class RideHailingCLI(cmd.Cmd):
     do_EOF = do_quit
 
 
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    args = parse_args(argv)
+    cli = RideHailingCLI(build_service(args.matching))
+    cli.intro = f"{cli.intro}\nDriver matching: {args.matching}"
+    cli.cmdloop()
+
+
 if __name__ == "__main__":
-    RideHailingCLI(build_service()).cmdloop()
+    main()

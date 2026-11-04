@@ -25,3 +25,14 @@ class NearestDriverStrategy(MatchingStrategy):
 
     def select_driver(self, candidates: Sequence[Driver], pickup: Location) -> Optional[Driver]:
         return min(candidates, key=lambda driver: driver.location.distance_to(pickup), default=None)
+
+
+class HighestRatedDriverStrategy(MatchingStrategy):
+    """Best-rated driver in range; ties go to the nearest, then the earliest registered."""
+
+    def select_driver(self, candidates: Sequence[Driver], pickup: Location) -> Optional[Driver]:
+        return min(
+            candidates,
+            key=lambda driver: (-driver.rating, driver.location.distance_to(pickup)),
+            default=None,
+        )
