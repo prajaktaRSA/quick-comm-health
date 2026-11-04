@@ -1,0 +1,101 @@
+from typing import List
+
+import pytest
+
+from cli import DEMO_SCRIPT, RideHailingCLI, build_service
+from thread_safe_service import ThreadSafeRideService
+
+
+@pytest.fixture
+def cli() -> RideHailingCLI:
+    return RideHailingCLI(build_service())
+
+
+def run(cli: RideHailingCLI, capsys: pytest.CaptureFixture, *commands: str) -> List[str]:
+    """Run commands and return the output lines of the last one."""
+    for command in commands[:-1]:
+        cli.onecmd(command)
+    capsys.readouterr()
+    cli.onecmd(commands[-1])
+    return capsys.readouterr().out.strip().splitlines()
+
+
+SETUP = ("add_user Asha", "add_driver Ravi sedan 1 0 4.5")
+
+
+def test_build_service_is_thread_safe() -> None:
+    assert isinstance(build_service(), ThreadSafeRideService)
+
+
+def test_book_and_end_ride(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    out = run(cli, capsys, *SETUP, "book U1 0 0 10 0 sedan", "end R1")
+    assert out == ["Ride R1 completed. Base Rs 69.00, discount Rs 0.00, total Rs 69.00"]
+
+
+def test_upgrade_is_shown_and_charged_at_hatchback_price(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    out = run(cli, capsys, *SETUP, "book U1 0 0 10 0 hatchback")
+    assert "hatchback (upgraded to sedan)" in out[0]
+    assert run(cli, capsys, "end R1") == ["Ride R1 completed. Base Rs 55.20, discount Rs 0.00, total Rs 55.20"]
+
+
+def test_coupon_flow(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    out = run(cli, capsys, *SETUP, "book U1 0 0 10 0 sedan", "add_coupon SAVE10 10", "apply_coupon R1 SAVE10", "end R1")
+    assert out == ["Ride R1 completed. Base Rs 69.00, discount Rs 6.90, total Rs 62.10"]
+
+
+def test_cancel_and_history_filter(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    assert run(cli, capsys, *SETUP, "book U1 0 0 10 0 sedan", "cancel R1") == [
+        "Ride R1 cancelled. Cancellation fee Rs 20.00"
+    ]
+    (line,) = run(cli, capsys, "history user U1 cancelled")
+    assert line.startswith("R1:") and "cancelled, fare Rs 20.00" in line
+    assert run(cli, capsys, "history driver D1 ongoing") == ["No rides for D1"]
+
+
+def test_move_driver_into_range(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    assert run(cli, capsys, "add_user Asha", "add_driver Ravi sedan 40 40 4.5", "book U1 0 0 1 0 sedan") == [
+        "Error: No driver for sedan within 5 km"
+    ]
+    out = run(cli, capsys, "move D1 1 1", "book U1 0 0 1 0 sedan")
+    assert out[0].startswith("Booked R1: user U1, driver D1")
+
+
+@pytest.mark.parametrize(
+    "command, message",
+    [
+        ("book U9 0 0 1 0 sedan", "Error: User U9 not found"),
+        ("add_driver Ravi suv 0 0 4", "Error: unknown value 'suv' (choose from hatchback, sedan)"),
+        ("add_driver Ravi sedan 0 0 9", "Error: rating must be between 0 and 5"),
+        ("move D1 a b", "Error: could not convert string to float: 'a'"),
+        ("end", "Error: usage: end RIDE_ID"),
+        ("history rider U1", "Error: usage: history user|driver ID [ongoing|completed|cancelled]"),
+        ("history user U1 pending", "Error: unknown value 'pending' (choose from ongoing, completed, cancelled)"),
+        ("add_coupon BAD 10 tomorrow", "Error: Invalid isoformat string: 'tomorrow'"),
+        ("apply_coupon R1 SAVE10", "Error: Ride R1 not found"),
+    ],
+)
+def test_errors_are_reported_without_crashing(
+    cli: RideHailingCLI, capsys: pytest.CaptureFixture, command: str, message: str
+) -> None:
+    assert run(cli, capsys, "add_user Asha", command) == [message]
+
+
+def test_demo_runs_every_feature(cli: RideHailingCLI, capsys: pytest.CaptureFixture) -> None:
+    out = "\n".join(run(cli, capsys, "demo"))
+    assert out.count("ride> ") == len(DEMO_SCRIPT)
+    for expected in [
+        "hatchback (upgraded to sedan)",
+        "Error: Coupon OLD20 has expired",
+        "Error: Coupon NOPE does not exist",
+        "Ride R1 completed. Base Rs 55.20, discount Rs 5.52, total Rs 49.68",
+        "Ride R2 completed. Base Rs 50.00, discount Rs 0.00, total Rs 50.00",
+        "Error: No driver for sedan within 5 km",
+        "Ride R3 cancelled. Cancellation fee Rs 20.00",
+        "Error: Ride R3 is already cancelled",
+        "Error: Coupon SAVE10 not found",
+    ]:
+        assert expected in out
+
+
+def test_quit_stops_the_loop(cli: RideHailingCLI) -> None:
+    assert cli.onecmd("quit") is True

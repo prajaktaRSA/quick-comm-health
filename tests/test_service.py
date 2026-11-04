@@ -1,12 +1,54 @@
+from datetime import datetime, timedelta
+from typing import Optional, Sequence
+
 import pytest
 
-from models import CarType, Location
-from service import NotFoundError, RideService
+from cancellation import CancellationFeePolicy
+from matching import MatchingStrategy, NearestDriverStrategy
+from models import CarType, Coupon, Driver, Location, Ride, RideStatus
+from pricing import PricingStrategy, TieredPricingStrategy
+from service import (
+    InvalidCouponError,
+    InvalidOperationError,
+    NoDriverAvailableError,
+    NotFoundError,
+    RideService,
+)
+
+ORIGIN = Location(0, 0)
+DROP = Location(10, 0)  # 10 km: sedan 69.0, hatchback 55.2
+NOW = datetime(2026, 11, 4, 12, 0)
+
+
+class FakeClock:
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
 
 
 @pytest.fixture
-def service() -> RideService:
-    return RideService()
+def clock() -> FakeClock:
+    return FakeClock(NOW)
+
+
+@pytest.fixture
+def service(clock: FakeClock) -> RideService:
+    return RideService(
+        pricing=TieredPricingStrategy(),
+        matching=NearestDriverStrategy(),
+        search_radius=5.0,
+        clock=clock,
+    )
+
+
+@pytest.fixture
+def ride(service: RideService) -> Ride:
+    """An ongoing 10 km sedan ride by U1 with driver D1."""
+    user = service.register_user("Asha")
+    service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+    return service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
 
 
 class TestRegistration:
@@ -23,21 +65,351 @@ class TestRegistration:
 
     def test_user_and_driver_ids_are_independent(self, service: RideService) -> None:
         service.register_user("Asha")
-        assert service.register_driver("Ravi", CarType.SEDAN, Location(0, 0), rating=5).id == "D1"
+        assert service.register_driver("Ravi", CarType.SEDAN, ORIGIN, rating=5).id == "D1"
 
     def test_invalid_rating_is_rejected_without_using_an_id(self, service: RideService) -> None:
         with pytest.raises(ValueError, match="rating"):
-            service.register_driver("Bad", CarType.SEDAN, Location(0, 0), rating=7)
-        assert service.register_driver("Good", CarType.SEDAN, Location(0, 0), rating=4).id == "D1"
+            service.register_driver("Bad", CarType.SEDAN, ORIGIN, rating=7)
+        assert service.register_driver("Good", CarType.SEDAN, ORIGIN, rating=4).id == "D1"
+
+    def test_search_radius_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="search_radius"):
+            RideService(pricing=TieredPricingStrategy(), matching=NearestDriverStrategy(), search_radius=0)
 
 
 class TestDriverLocation:
     def test_update_moves_registered_driver(self, service: RideService) -> None:
-        driver = service.register_driver("Ravi", CarType.HATCHBACK, Location(0, 0), rating=4.5)
+        driver = service.register_driver("Ravi", CarType.HATCHBACK, ORIGIN, rating=4.5)
         updated = service.update_driver_location(driver.id, Location(3, 4))
         assert updated is driver
         assert driver.location == Location(3, 4)
 
     def test_unknown_driver_raises_not_found(self, service: RideService) -> None:
         with pytest.raises(NotFoundError, match="D99"):
-            service.update_driver_location("D99", Location(0, 0))
+            service.update_driver_location("D99", ORIGIN)
+
+
+class TestBooking:
+    def test_books_nearest_driver_of_requested_type(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Far", CarType.SEDAN, Location(4, 0), rating=5)
+        near = service.register_driver("Near", CarType.SEDAN, Location(1, 0), rating=4)
+
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+
+        assert ride.id == "R1"
+        assert ride.driver_id == near.id
+        assert ride.status is RideStatus.ONGOING
+        assert not ride.is_upgraded
+        assert not near.is_available
+
+    def test_hatchback_preferred_over_nearer_sedan(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=5)
+        hatchback = service.register_driver("Hatch", CarType.HATCHBACK, Location(4, 0), rating=4)
+
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
+
+        assert ride.driver_id == hatchback.id
+        assert not ride.is_upgraded
+
+    def test_hatchback_unavailable_upgrades_to_sedan(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Hatch far away", CarType.HATCHBACK, Location(50, 0), rating=5)
+        sedan = service.register_driver("Sedan", CarType.SEDAN, Location(2, 0), rating=4)
+
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
+
+        assert ride.driver_id == sedan.id
+        assert ride.requested_car_type is CarType.HATCHBACK
+        assert ride.assigned_car_type is CarType.SEDAN
+        assert ride.is_upgraded
+
+    def test_sedan_request_never_downgrades_to_hatchback(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Hatch", CarType.HATCHBACK, Location(1, 0), rating=5)
+        with pytest.raises(NoDriverAvailableError, match="sedan"):
+            service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+
+    def test_driver_exactly_on_radius_is_eligible(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        driver = service.register_driver("Edge", CarType.SEDAN, Location(3, 4), rating=4)  # 5 km away
+        assert service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN).driver_id == driver.id
+
+    def test_driver_outside_radius_is_ignored(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Far", CarType.SEDAN, Location(5.01, 0), rating=5)
+        with pytest.raises(NoDriverAvailableError):
+            service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+
+    def test_booked_driver_is_not_matched_again(self, service: RideService) -> None:
+        asha, rohan = service.register_user("Asha"), service.register_user("Rohan")
+        service.register_driver("Only", CarType.SEDAN, Location(1, 0), rating=5)
+        service.book_ride(asha.id, ORIGIN, DROP, CarType.SEDAN)
+        with pytest.raises(NoDriverAvailableError):
+            service.book_ride(rohan.id, ORIGIN, DROP, CarType.SEDAN)
+
+    def test_user_cannot_have_two_ongoing_rides(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("A", CarType.SEDAN, Location(1, 0), rating=5)
+        service.register_driver("B", CarType.SEDAN, Location(2, 0), rating=5)
+        service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+        with pytest.raises(InvalidOperationError, match="ongoing"):
+            service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+
+    def test_unknown_user_raises_not_found(self, service: RideService) -> None:
+        service.register_driver("A", CarType.SEDAN, Location(1, 0), rating=5)
+        with pytest.raises(NotFoundError, match="U99"):
+            service.book_ride("U99", ORIGIN, DROP, CarType.SEDAN)
+
+    def test_uses_injected_matching_strategy(self) -> None:
+        class HighestRated(MatchingStrategy):
+            def select_driver(self, candidates: Sequence[Driver], pickup: Location) -> Optional[Driver]:
+                return max(candidates, key=lambda d: d.rating, default=None)
+
+        service = RideService(pricing=TieredPricingStrategy(), matching=HighestRated())
+        user = service.register_user("Asha")
+        service.register_driver("Near", CarType.SEDAN, Location(1, 0), rating=3.9)
+        best = service.register_driver("Far", CarType.SEDAN, Location(4, 0), rating=4.9)
+
+        assert service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN).driver_id == best.id
+
+    def test_upgrade_paths_are_configurable(self) -> None:
+        no_upgrades = {CarType.HATCHBACK: (CarType.HATCHBACK,), CarType.SEDAN: (CarType.SEDAN,)}
+        service = RideService(
+            pricing=TieredPricingStrategy(), matching=NearestDriverStrategy(), car_type_fallbacks=no_upgrades
+        )
+        user = service.register_user("Asha")
+        service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=5)
+        with pytest.raises(NoDriverAvailableError, match="hatchback"):
+            service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
+
+
+class TestEndRide:
+    def test_charges_tiered_fare_and_completes_ride(self, service: RideService, ride: Ride) -> None:
+        fare = service.end_ride(ride.id)
+        assert (fare.base_fare, fare.discount, fare.total) == (69.0, 0.0, 69.0)
+        assert ride.status is RideStatus.COMPLETED
+        assert ride.fare == 69.0
+
+    def test_driver_is_freed_at_drop_location(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        driver = service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+        service.end_ride(ride.id)
+        assert driver.location == DROP
+        assert driver.is_available
+
+    def test_upgraded_ride_is_charged_hatchback_price(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=4.5)
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
+        assert ride.is_upgraded
+        assert service.end_ride(ride.id).total == pytest.approx(55.2)
+
+    def test_user_can_book_again_after_ride_ends(self, service: RideService, ride: Ride) -> None:
+        service.end_ride(ride.id)
+        assert service.book_ride(ride.user_id, DROP, ORIGIN, CarType.SEDAN).id == "R2"
+
+    def test_cannot_end_ride_twice(self, service: RideService, ride: Ride) -> None:
+        service.end_ride(ride.id)
+        with pytest.raises(InvalidOperationError, match="already completed"):
+            service.end_ride(ride.id)
+
+    def test_unknown_ride_raises_not_found(self, service: RideService) -> None:
+        with pytest.raises(NotFoundError, match="R99"):
+            service.end_ride("R99")
+
+    def test_uses_injected_pricing_strategy(self) -> None:
+        class FlatPricing(PricingStrategy):
+            def calculate_fare(self, ride: Ride) -> float:
+                return 100.0
+
+        service = RideService(pricing=FlatPricing(), matching=NearestDriverStrategy())
+        user = service.register_user("Asha")
+        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+        assert service.end_ride(ride.id).total == 100.0
+
+
+class TestCoupons:
+    def test_applied_coupon_discounts_fare(self, service: RideService, ride: Ride) -> None:
+        service.add_coupon(Coupon("SAVE10", 10))
+        service.apply_coupon(ride.id, "SAVE10")
+        fare = service.end_ride(ride.id)
+        assert (fare.base_fare, fare.discount, fare.total) == (69.0, 6.9, 62.1)
+        assert ride.coupon_code == "SAVE10"
+        assert ride.fare == 62.1
+
+    def test_coupon_applies_after_minimum_fare(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        ride = service.book_ride(user.id, ORIGIN, Location(2, 0), CarType.SEDAN)  # minimum fare 50
+        service.add_coupon(Coupon("SAVE20", 20))
+        service.apply_coupon(ride.id, "SAVE20")
+        assert service.end_ride(ride.id).total == pytest.approx(40.0)
+
+    def test_duplicate_coupon_is_rejected(self, service: RideService) -> None:
+        service.add_coupon(Coupon("SAVE10", 10))
+        with pytest.raises(InvalidOperationError, match="already exists"):
+            service.add_coupon(Coupon("SAVE10", 20))
+
+    def test_deleting_unknown_coupon_raises_not_found(self, service: RideService) -> None:
+        with pytest.raises(NotFoundError, match="NOPE"):
+            service.delete_coupon("NOPE")
+
+    def test_unknown_coupon_cannot_be_applied(self, service: RideService, ride: Ride) -> None:
+        with pytest.raises(InvalidCouponError, match="does not exist"):
+            service.apply_coupon(ride.id, "NOPE")
+        assert ride.coupon_code is None
+
+    def test_deleted_coupon_cannot_be_applied(self, service: RideService, ride: Ride) -> None:
+        service.add_coupon(Coupon("SAVE10", 10))
+        service.delete_coupon("SAVE10")
+        with pytest.raises(InvalidCouponError, match="does not exist"):
+            service.apply_coupon(ride.id, "SAVE10")
+
+    def test_expired_coupon_cannot_be_applied(self, service: RideService, ride: Ride) -> None:
+        service.add_coupon(Coupon("OLD", 10, expires_at=NOW - timedelta(days=1)))
+        with pytest.raises(InvalidCouponError, match="expired"):
+            service.apply_coupon(ride.id, "OLD")
+        assert ride.coupon_code is None
+
+    def test_coupon_cannot_be_applied_to_completed_ride(self, service: RideService, ride: Ride) -> None:
+        service.add_coupon(Coupon("SAVE10", 10))
+        service.end_ride(ride.id)
+        with pytest.raises(InvalidOperationError, match="already completed"):
+            service.apply_coupon(ride.id, "SAVE10")
+
+    def test_coupon_expiring_before_ride_ends_is_dropped(
+        self, service: RideService, ride: Ride, clock: FakeClock
+    ) -> None:
+        service.add_coupon(Coupon("SOON", 10, expires_at=NOW + timedelta(minutes=30)))
+        service.apply_coupon(ride.id, "SOON")
+        clock.now = NOW + timedelta(hours=1)
+        fare = service.end_ride(ride.id)
+        assert (fare.discount, fare.total) == (0.0, 69.0)
+        assert ride.coupon_code is None
+
+    def test_coupon_deleted_before_ride_ends_is_dropped(self, service: RideService, ride: Ride) -> None:
+        service.add_coupon(Coupon("SAVE10", 10))
+        service.apply_coupon(ride.id, "SAVE10")
+        service.delete_coupon("SAVE10")
+        assert service.end_ride(ride.id).total == 69.0
+        assert ride.coupon_code is None
+
+
+class TestCancellation:
+    def test_cancel_charges_flat_fee(self, service: RideService, ride: Ride) -> None:
+        assert service.cancel_ride(ride.id) == 20.0
+        assert ride.status is RideStatus.CANCELLED
+        assert ride.fare == 20.0
+
+    def test_driver_is_freed_where_they_are(self, service: RideService) -> None:
+        user = service.register_user("Asha")
+        driver = service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.SEDAN)
+        service.cancel_ride(ride.id)
+        assert driver.is_available
+        assert driver.location == Location(1, 0)
+
+    def test_user_can_book_again_after_cancelling(self, service: RideService, ride: Ride) -> None:
+        service.cancel_ride(ride.id)
+        assert service.book_ride(ride.user_id, ORIGIN, DROP, CarType.SEDAN).id == "R2"
+
+    def test_coupon_is_not_applied_to_fee(self, service: RideService, ride: Ride) -> None:
+        service.add_coupon(Coupon("SAVE50", 50))
+        service.apply_coupon(ride.id, "SAVE50")
+        assert service.cancel_ride(ride.id) == 20.0
+        assert ride.coupon_code is None
+
+    def test_cannot_cancel_completed_ride(self, service: RideService, ride: Ride) -> None:
+        service.end_ride(ride.id)
+        with pytest.raises(InvalidOperationError, match="already completed"):
+            service.cancel_ride(ride.id)
+
+    def test_cannot_end_or_recancel_cancelled_ride(self, service: RideService, ride: Ride) -> None:
+        service.cancel_ride(ride.id)
+        with pytest.raises(InvalidOperationError, match="already cancelled"):
+            service.end_ride(ride.id)
+        with pytest.raises(InvalidOperationError, match="already cancelled"):
+            service.cancel_ride(ride.id)
+
+    def test_unknown_ride_raises_not_found(self, service: RideService) -> None:
+        with pytest.raises(NotFoundError, match="R99"):
+            service.cancel_ride("R99")
+
+    def test_uses_injected_cancellation_policy(self) -> None:
+        class FreeForUpgrades(CancellationFeePolicy):
+            def fee_for(self, ride: Ride) -> float:
+                return 0.0 if ride.is_upgraded else 20.0
+
+        service = RideService(
+            pricing=TieredPricingStrategy(), matching=NearestDriverStrategy(), cancellation_policy=FreeForUpgrades()
+        )
+        user = service.register_user("Asha")
+        service.register_driver("Sedan", CarType.SEDAN, Location(1, 0), rating=4.5)
+        ride = service.book_ride(user.id, ORIGIN, DROP, CarType.HATCHBACK)
+        assert service.cancel_ride(ride.id) == 0.0
+
+    def test_cancelled_rides_appear_in_history_filter(self, service: RideService, ride: Ride) -> None:
+        service.cancel_ride(ride.id)
+        assert service.user_history(ride.user_id, RideStatus.CANCELLED) == [ride]
+        assert service.user_history(ride.user_id, RideStatus.ONGOING) == []
+        assert service.driver_history(ride.driver_id, RideStatus.CANCELLED) == [ride]
+
+
+class TestHistory:
+    @pytest.fixture
+    def history_service(self, service: RideService) -> RideService:
+        """U1: R1 completed, R3 ongoing. U2: R2 ongoing. D1: R1, R2. D2: R3."""
+        asha, rohan = service.register_user("Asha"), service.register_user("Rohan")
+        service.register_driver("Ravi", CarType.SEDAN, Location(1, 0), rating=4.5)
+        service.register_driver("Sunil", CarType.SEDAN, Location(2, 0), rating=4.5)
+        short_drop = Location(1, 0)
+        service.end_ride(service.book_ride(asha.id, ORIGIN, short_drop, CarType.SEDAN).id)  # R1 by D1
+        service.book_ride(rohan.id, ORIGIN, short_drop, CarType.SEDAN)  # R2 by D1
+        service.book_ride(asha.id, ORIGIN, short_drop, CarType.SEDAN)  # R3 by D2 (D1 busy)
+        return service
+
+    @staticmethod
+    def ids(rides: Sequence[Ride]) -> list:
+        return [r.id for r in rides]
+
+    @pytest.mark.parametrize(
+        "status, expected",
+        [(None, ["R1", "R3"]), (RideStatus.ONGOING, ["R3"]), (RideStatus.COMPLETED, ["R1"])],
+    )
+    def test_user_history_by_status(
+        self, history_service: RideService, status: Optional[RideStatus], expected: list
+    ) -> None:
+        assert self.ids(history_service.user_history("U1", status)) == expected
+
+    @pytest.mark.parametrize(
+        "status, expected",
+        [(None, ["R1", "R2"]), (RideStatus.ONGOING, ["R2"]), (RideStatus.COMPLETED, ["R1"])],
+    )
+    def test_driver_history_by_status(
+        self, history_service: RideService, status: Optional[RideStatus], expected: list
+    ) -> None:
+        assert self.ids(history_service.driver_history("D1", status)) == expected
+
+    def test_history_excludes_other_users_and_drivers(self, history_service: RideService) -> None:
+        assert self.ids(history_service.user_history("U2")) == ["R2"]
+        assert self.ids(history_service.driver_history("D2")) == ["R3"]
+
+    def test_completed_ride_in_history_carries_fare(self, history_service: RideService) -> None:
+        (completed,) = history_service.user_history("U1", RideStatus.COMPLETED)
+        assert completed.fare == 50.0  # 1 km sedan, minimum fare
+
+    def test_new_user_and_driver_have_empty_history(self, service: RideService) -> None:
+        user = service.register_user("New")
+        driver = service.register_driver("New", CarType.SEDAN, ORIGIN, rating=4)
+        assert service.user_history(user.id) == []
+        assert service.driver_history(driver.id) == []
+
+    def test_unknown_user_or_driver_raises_not_found(self, service: RideService) -> None:
+        with pytest.raises(NotFoundError, match="U99"):
+            service.user_history("U99")
+        with pytest.raises(NotFoundError, match="D99"):
+            service.driver_history("D99")

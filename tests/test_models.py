@@ -51,6 +51,24 @@ class TestRide:
         with pytest.raises(ValueError, match="already completed"):
             ride.complete(60.0)
 
+    def test_cancel_sets_status_and_fee(self) -> None:
+        ride = self.make_ride()
+        ride.cancel(20.0)
+        assert ride.status is RideStatus.CANCELLED
+        assert ride.fare == 20.0
+
+    def test_cannot_complete_cancelled_ride(self) -> None:
+        ride = self.make_ride()
+        ride.cancel(20.0)
+        with pytest.raises(ValueError, match="already cancelled"):
+            ride.complete(50.0)
+
+    def test_cannot_cancel_completed_ride(self) -> None:
+        ride = self.make_ride()
+        ride.complete(50.0)
+        with pytest.raises(ValueError, match="already completed"):
+            ride.cancel(20.0)
+
 
 class TestDriver:
     @pytest.mark.parametrize("rating", [-0.1, 5.1])
